@@ -13,12 +13,17 @@ import comtypes
 from comtypes import COMMETHOD, GUID, IUnknown
 import numpy as np
 import psutil
-import pyaudiowpatch as pyaudio
 import sounddevice as sd
 
 import paths
 
 _log = logging.getLogger("clipmic.audio_buffer")
+
+
+def _import_pyaudio():
+    """Lazily import pyaudiowpatch only when legacy WASAPI loopback fallback is needed."""
+    import pyaudiowpatch as pyaudio
+    return pyaudio
 
 # Minimal Windows Core Audio COM interfaces to inspect active playback sessions (apps/games)
 CLSID_MMDeviceEnumerator = GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
@@ -485,6 +490,7 @@ def get_active_audio_sessions() -> list[str]:
 
 def list_loopback_devices() -> list[str]:
     """List available Windows WASAPI loopback playback device names."""
+    pyaudio = _import_pyaudio()
     pa = pyaudio.PyAudio()
     try:
         return [str(d["name"]) for d in pa.get_loopback_device_info_generator()]
@@ -578,7 +584,8 @@ class LoopbackRingBuffer:
 
         self._lock = threading.Lock()
         self._ctrl_lock = threading.Lock()
-        self._pa: Optional[pyaudio.PyAudio] = None
+        self._pa: Optional[object] = None
+        self._pa_continue: int = 0
         self._stream = None
         self._running = False
         self._stop_event = threading.Event()
@@ -640,7 +647,8 @@ class LoopbackRingBuffer:
     def is_receiving_audio(self) -> bool:
         return self._running and (time.monotonic() - self._last_signal_ts) < 1.8
 
-    def _find_loopback_device(self, pa: pyaudio.PyAudio) -> dict:
+    def _find_loopback_device(self, pa) -> dict:
+        pyaudio = _import_pyaudio()
         if self.target_device:
             for loopback in pa.get_loopback_device_info_generator():
                 if str(loopback["name"]) == self.target_device:
@@ -691,6 +699,8 @@ class LoopbackRingBuffer:
                 pass
 
     def _open_stream(self) -> None:
+        pyaudio = _import_pyaudio()
+        self._pa_continue = int(pyaudio.paContinue)
         pa = pyaudio.PyAudio()
         try:
             dev = self._find_loopback_device(pa)
@@ -873,21 +883,22 @@ class LoopbackRingBuffer:
             self._set_state("stopped", "")
 
     def _on_audio(self, in_data, frame_count: int, time_info, status_flags):
+        pa_continue = self._pa_continue
         if not self._running or not in_data:
-            return (None, pyaudio.paContinue)
+            return (None, pa_continue)
 
         raw = np.frombuffer(in_data, dtype=np.int16)
         in_ch = self._stream_channels
         usable = (len(raw) // in_ch) * in_ch
         if usable == 0:
-            return (None, pyaudio.paContinue)
+            return (None, pa_continue)
         frames = raw[:usable].reshape(-1, in_ch)
         if in_ch > 2:
             frames = _downmix_to_stereo(frames, self._downmix_scratch, self._downmix_fscratch)
 
         # If Discord listening is toggled OFF and Discord is the only active app, skip buffering
         if not self.include_discord and self._discord_only:
-            return (None, pyaudio.paContinue)
+            return (None, pa_continue)
 
         # Peak check without allocating an abs copy of the full array
         if int(frames.max()) > 40 or int(frames.min()) < -40:
@@ -897,7 +908,7 @@ class LoopbackRingBuffer:
         with self._lock:
             cap = self._capacity
             if cap <= 0 or frames.shape[1] != self._buf.shape[1]:
-                return (None, pyaudio.paContinue)
+                return (None, pa_continue)
             if n >= cap:
                 self._buf[:] = frames[-cap:]
                 self._write_pos = 0
@@ -914,7 +925,7 @@ class LoopbackRingBuffer:
                 self._filled = min(cap, self._filled + n)
             self._last_callback_ts = time.monotonic()
 
-        return (None, pyaudio.paContinue)
+        return (None, pa_continue)
 
     def set_duration(self, duration_s: float) -> None:
         """Resize the loopback ring buffer in place without restarting the audio stream."""

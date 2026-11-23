@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import gc
 import sys
 import time
 import uuid
@@ -10,7 +11,7 @@ from typing import Callable, Optional
 
 import numpy as np
 from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -355,6 +356,25 @@ def _install_app_style() -> None:
         app.setStyle(_ClipMicStyle(app.style()))
 
 
+def _trim_working_set() -> None:
+    """Ask Windows to trim unused working-set pages while hidden in the system tray."""
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wt.HANDLE
+        hproc = kernel32.GetCurrentProcess()
+        empty_ws = getattr(kernel32, "K32EmptyWorkingSet", None)
+        if empty_ws is None:
+            empty_ws = ctypes.windll.psapi.EmptyWorkingSet
+        empty_ws.argtypes = [wt.HANDLE]
+        empty_ws.restype = wt.BOOL
+        empty_ws(hproc)
+    except Exception:
+        pass
+
+
 def apply_dark_titlebar(widget: QWidget, bg_hex: str = "#0B0B0C") -> None:
     """Apply Windows 10/11 dark native title bar matching ClipMic's background."""
     if sys.platform != "win32":
@@ -596,6 +616,9 @@ class WaveformWidget(QWidget):
         self._cache_dim = None
         self._cache_lit = None
         self._cache_key = None
+
+    def release_cache(self) -> None:
+        self._invalidate_cache()
 
     def set_audio(self, peaks: np.ndarray, duration_s: float) -> None:
         self._peaks = np.asarray(peaks, dtype=np.float32)
@@ -1569,6 +1592,10 @@ class MiniWaveformWidget(QWidget):
             self._cache = None
             self.update()
 
+    def release_cache(self) -> None:
+        self._cache = None
+        self._cache_key = None
+
     def set_playhead_fraction(self, frac: Optional[float]) -> None:
         self._play_frac = frac
         self.update()
@@ -1955,12 +1982,20 @@ class ChannelPickerDialog(QDialog):
             self._dark_titlebar_applied = True
             apply_dark_titlebar(self)
 
+    def _release_waveform_caches(self) -> None:
+        for _chk, mini, _btn, _ch in self._rows.values():
+            mini.release_cache()
+        QPixmapCache.clear()
+        gc.collect()
+
     def closeEvent(self, event) -> None:
         self.stop_preview()
+        self._release_waveform_caches()
         super().closeEvent(event)
 
     def done(self, result: int) -> None:
         self.stop_preview()
+        self._release_waveform_caches()
         super().done(result)
 
 
@@ -2517,6 +2552,12 @@ class TrimDialog(QDialog):
             self._dark_titlebar_applied = True
             apply_dark_titlebar(self)
 
+    def _release_waveform_cache(self) -> None:
+        if hasattr(self, "_waveform") and self._waveform is not None:
+            self._waveform.release_cache()
+        QPixmapCache.clear()
+        gc.collect()
+
     def closeEvent(self, event) -> None:
         self._stop_playhead()
         self._injector.stop()
@@ -2524,12 +2565,14 @@ class TrimDialog(QDialog):
             self._worker_thread.quit()
             self._worker_thread.wait(1000)
         self._cleanup_temp_previews()
+        self._release_waveform_cache()
         super().closeEvent(event)
 
     def done(self, result: int) -> None:
         self._stop_playhead()
         self._injector.stop()
         self._cleanup_temp_previews()
+        self._release_waveform_cache()
         super().done(result)
 
 
@@ -2706,19 +2749,25 @@ class _AudioDropZone(QFrame):
 
 
 class _DeviceScanWorker(QObject):
-    """Background PortAudio device enumerator so MainWindow opens instantly."""
+    """Background audio device enumerator so MainWindow opens instantly."""
 
     finished = Signal(object, object)  # (mics: list[dict], loopbacks: list[str])
+
+    def __init__(self, include_loopbacks: bool = True) -> None:
+        super().__init__()
+        self._include_loopbacks = bool(include_loopbacks)
 
     def run(self) -> None:
         try:
             mics = list_microphones()
         except Exception:
             mics = []
-        try:
-            loopbacks = list_loopback_devices()
-        except Exception:
-            loopbacks = []
+        loopbacks: list[str] = []
+        if self._include_loopbacks:
+            try:
+                loopbacks = list_loopback_devices()
+            except Exception:
+                loopbacks = []
         self.finished.emit(mics, loopbacks)
 
 
@@ -2770,6 +2819,10 @@ class MainWindow(QMainWindow):
         self._apo_worker: Optional[_ApoProcessWorker] = None
         self._devices_scanned: bool = False
         self._default_mic_name: Optional[str] = None
+        self._tray_trim_timer = QTimer(self)
+        self._tray_trim_timer.setSingleShot(True)
+        self._tray_trim_timer.setInterval(250)
+        self._tray_trim_timer.timeout.connect(self._on_tray_trim_timeout)
 
         self.setWindowTitle(t("app.title"))
         self.setWindowIcon(make_app_icon())
@@ -3198,7 +3251,8 @@ class MainWindow(QMainWindow):
             return
         self._refresh_dev_btn.setEnabled(False)
         thread = QThread(self)
-        worker = _DeviceScanWorker()
+        include_loopbacks = getattr(self._ring, "mode", "") != "procloop"
+        worker = _DeviceScanWorker(include_loopbacks=include_loopbacks)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_devices_scanned, Qt.ConnectionType.QueuedConnection)
@@ -3266,8 +3320,20 @@ class MainWindow(QMainWindow):
         if not self._session_timer.isActive():
             self._session_timer.start()
 
+    def _on_tray_trim_timeout(self) -> None:
+        if self.isVisible() and not self.isMinimized():
+            return
+        if self._active_picker is not None and self._active_picker.isVisible():
+            return
+        if self._active_popup is not None and self._active_popup.isVisible():
+            return
+        QPixmapCache.clear()
+        gc.collect()
+        _trim_working_set()
+
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._tray_trim_timer.stop()
         if not getattr(self, "_dark_titlebar_applied", False):
             self._dark_titlebar_applied = True
             apply_dark_titlebar(self)
@@ -3275,6 +3341,7 @@ class MainWindow(QMainWindow):
 
     def hideEvent(self, event) -> None:
         self._pause_ui_timers()
+        self._tray_trim_timer.start()
         super().hideEvent(event)
 
     def changeEvent(self, event) -> None:
@@ -3282,11 +3349,14 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.Type.WindowStateChange:
             if self.isMinimized():
                 self._pause_ui_timers()
+                self._tray_trim_timer.start()
             elif self.isVisible():
+                self._tray_trim_timer.stop()
                 self._resume_ui_timers()
 
     def shutdown(self) -> None:
         """Stop timers, background scan/decode threads, and any open capture/trim popups cleanly."""
+        self._tray_trim_timer.stop()
         self._session_timer.stop()
         if self._toast_label is not None:
             try:

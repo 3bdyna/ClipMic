@@ -32,4 +32,6 @@ python main.py
 - `native/` — C++ sources and build scripts for `clipmic_procloop.dll` (Process Loopback) and `clipmic_apo.dll` (Direct Mic APO).
 
 ## License
-See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+Licensed under the **GNU General Public License v3.0 (GPL-3.0)** — see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+
+The Direct Mic APO technique was inspired by [Onion Board](https://github.com/Onion-Alien/onion-board).

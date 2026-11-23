@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes as wt
 import sys
 import time
 import uuid
@@ -2587,6 +2588,44 @@ class _ExportWorker(QThread):
             self.export_finished.emit(str(self.dst_mp3), str(exc))
 
 
+class _ApoProcessWorker(QThread):
+    """Waits on the elevated APO setup process handle and reads its log on exit."""
+
+    finished_apo = Signal(int, str)  # (exit_code, log_text)
+
+    def __init__(self, h_process: int, log_path: Path, parent=None) -> None:
+        super().__init__(parent)
+        self._h_process = int(h_process)
+        self._log_path = Path(log_path)
+
+    def run(self) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+        kernel32.WaitForSingleObject.restype = wt.DWORD
+        kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wt.BOOL
+        kernel32.CloseHandle.argtypes = [wt.HANDLE]
+        kernel32.CloseHandle.restype = wt.BOOL
+
+        exit_code = -1
+        handle = wt.HANDLE(self._h_process)
+        try:
+            if kernel32.WaitForSingleObject(handle, 60000) == 0:
+                code = wt.DWORD()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    exit_code = int(code.value)
+        finally:
+            kernel32.CloseHandle(handle)
+
+        log_text = ""
+        if self._log_path.is_file():
+            try:
+                log_text = self._log_path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                pass
+        self.finished_apo.emit(exit_code, log_text)
+
+
 class _AudioDropZone(QFrame):
     """Low-profile drag-and-drop & click-to-browse media import bar."""
 
@@ -2728,6 +2767,7 @@ class MainWindow(QMainWindow):
         self._pending_import_wav: Optional[Path] = None
         self._last_export_dir: Optional[Path] = None
         self._export_workers: list[_ExportWorker] = []
+        self._apo_worker: Optional[_ApoProcessWorker] = None
         self._devices_scanned: bool = False
         self._default_mic_name: Optional[str] = None
 
@@ -3269,6 +3309,9 @@ class MainWindow(QMainWindow):
             if worker.isRunning():
                 worker.wait(350)
         self._export_workers.clear()
+        if self._apo_worker is not None and self._apo_worker.isRunning():
+            self._apo_worker.wait(500)
+        self._apo_worker = None
         if self._pending_import_wav is not None and self._pending_import_wav.is_file():
             try:
                 self._pending_import_wav.unlink()
@@ -3580,24 +3623,12 @@ class MainWindow(QMainWindow):
         self._status_bar_lbl.setText(t("main.status_bar", buf_state=buf_state, device=cap_dev, mic=mic_label, mode=mode_lbl))
 
     def restore_all_mics_action(self) -> None:
-        self._apo_btn.setDisabled(True)
-        self._apo_btn.setText(t("main.restoring"))
-        if not apo_setup.launch_elevated("restore-all"):
-            self._apo_btn.setDisabled(False)
-            self._refresh_status()
-            return
-        self._poll_apo_done(attempts=24)
+        self._start_apo_action("restore-all", None, "main.restoring", "main.apo_status_restoring")
 
     def _on_toggle_apo(self) -> None:
         st = self._injector.refresh_apo_status()
         if st.get("active"):
-            self._apo_btn.setDisabled(True)
-            self._apo_btn.setText(t("main.restoring"))
-            if not apo_setup.launch_elevated("uninstall", self._current_mic_guid()):
-                self._apo_btn.setDisabled(False)
-                self._refresh_status()
-                return
-            self._poll_apo_done(attempts=24)
+            self._start_apo_action("uninstall", self._current_mic_guid(), "main.restoring", "main.apo_status_restoring")
             return
 
         if not st.get("dll_built"):
@@ -3621,28 +3652,60 @@ class MainWindow(QMainWindow):
             )
             if ans != QMessageBox.StandardButton.Yes:
                 return
-        self._apo_btn.setDisabled(True)
-        self._apo_btn.setText(t("main.enabling"))
-        if not apo_setup.launch_elevated("install", guid):
-            self._apo_btn.setDisabled(False)
-            self._refresh_status()
-            return
-        self._poll_apo_done(attempts=24)
+        self._start_apo_action("install", guid, "main.enabling", "main.apo_status_enabling")
 
-    def _poll_apo_done(self, attempts: int) -> None:
-        log_path = apo_setup.setup_log_path()
-        if log_path.is_file():
+    def _start_apo_action(
+        self,
+        action: str,
+        guid: Optional[str],
+        btn_key: str,
+        status_key: str,
+    ) -> None:
+        if self._apo_worker is not None and self._apo_worker.isRunning():
+            return
+        self._apo_btn.setDisabled(True)
+        self._apo_btn.setText(t(btn_key))
+        self._status_bar_lbl.setText(t(status_key))
+        try:
+            h_process, cancelled = apo_setup.launch_elevated(action, guid)
+        except OSError as exc:
             self._apo_btn.setDisabled(False)
             self._refresh_status()
-            txt = log_path.read_text(encoding="utf-8", errors="replace").strip()
-            if txt.startswith("ERROR:"):
-                QMessageBox.warning(self, t("main.err_apo_setup_title"), txt.splitlines()[0])
+            QMessageBox.warning(self, t("main.err_apo_setup_title"), str(exc))
             return
-        if attempts <= 0:
+
+        if cancelled:
+            self._apo_btn.setDisabled(False)
+            self._refresh_status()
+            self._status_bar_lbl.setText(t("main.apo_uac_cancelled"))
+            return
+
+        if not h_process:
             self._apo_btn.setDisabled(False)
             self._refresh_status()
             return
-        QTimer.singleShot(500, lambda: self._poll_apo_done(attempts - 1))
+
+        worker = _ApoProcessWorker(h_process, apo_setup.setup_log_path(), self)
+        self._apo_worker = worker
+        worker.finished_apo.connect(self._on_apo_finished)
+        worker.start()
+
+    @Slot(int, str)
+    def _on_apo_finished(self, exit_code: int, log_text: str) -> None:
+        worker = self._apo_worker
+        self._apo_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._apo_btn.setDisabled(False)
+        self._refresh_status()
+        if log_text.startswith("ERROR:") or (exit_code != 0 and log_text):
+            QMessageBox.warning(self, t("main.err_apo_setup_title"), log_text.splitlines()[0])
+        elif exit_code != 0:
+            QMessageBox.warning(
+                self,
+                t("main.err_apo_setup_title"),
+                f"Elevated setup exited with code {exit_code}.",
+            )
 
     def get_volumes(self) -> tuple[bool, float, float]:
         return (

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import hashlib
 import json
 import os
 import shutil
@@ -78,6 +79,53 @@ HEADER_BYTES = 4096
 HEADER_FMT = "<IIIIQQIIffIIII"
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+_SC_MANAGER_CONNECT = 0x0001
+_SERVICE_QUERY_STATUS = 0x0004
+_SERVICE_START = 0x0010
+_SERVICE_STOP = 0x0020
+_SERVICE_CONTROL_STOP = 0x00000001
+_SC_STATUS_PROCESS_INFO = 0
+_SERVICE_STOPPED = 0x00000001
+_SERVICE_RUNNING = 0x00000004
+_ERROR_SERVICE_ALREADY_RUNNING = 1056
+_ERROR_SERVICE_NOT_ACTIVE = 1062
+_ERROR_CANCELLED = 1223
+_SEE_MASK_NOCLOSEPROCESS = 0x00000040
+
+
+class _SERVICE_STATUS_PROCESS(ctypes.Structure):
+    _fields_ = [
+        ("dwServiceType", wt.DWORD),
+        ("dwCurrentState", wt.DWORD),
+        ("dwControlsAccepted", wt.DWORD),
+        ("dwWin32ExitCode", wt.DWORD),
+        ("dwServiceSpecificExitCode", wt.DWORD),
+        ("dwCheckPoint", wt.DWORD),
+        ("dwWaitHint", wt.DWORD),
+        ("dwProcessId", wt.DWORD),
+        ("dwServiceFlags", wt.DWORD),
+    ]
+
+
+class SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wt.DWORD),
+        ("fMask", wt.ULONG),
+        ("hwnd", wt.HWND),
+        ("lpVerb", wt.LPCWSTR),
+        ("lpFile", wt.LPCWSTR),
+        ("lpParameters", wt.LPCWSTR),
+        ("lpDirectory", wt.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wt.HINSTANCE),
+        ("lpIDList", wt.LPVOID),
+        ("lpClass", wt.LPCWSTR),
+        ("hkeyClass", wt.HKEY),
+        ("dwHotKey", wt.DWORD),
+        ("hIconOrMonitor", wt.HANDLE),
+        ("hProcess", wt.HANDLE),
+    ]
 
 
 def setup_log_path() -> Path:
@@ -343,15 +391,110 @@ def _run_hidden(cmd: list[str], timeout: int = 20) -> int:
         return -1
 
 
-def _stop_audio_services() -> None:
-    _run_hidden(["net", "stop", "Audiosrv", "/y"])
-    _run_hidden(["net", "stop", "AudioEndpointBuilder", "/y"])
-    time.sleep(0.6)
+def _scm_advapi():
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.OpenSCManagerW.argtypes = [wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
+    advapi.OpenSCManagerW.restype = wt.HANDLE
+    advapi.OpenServiceW.argtypes = [wt.HANDLE, wt.LPCWSTR, wt.DWORD]
+    advapi.OpenServiceW.restype = wt.HANDLE
+    advapi.CloseServiceHandle.argtypes = [wt.HANDLE]
+    advapi.CloseServiceHandle.restype = wt.BOOL
+    advapi.QueryServiceStatusEx.argtypes = [
+        wt.HANDLE, wt.DWORD, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD),
+    ]
+    advapi.QueryServiceStatusEx.restype = wt.BOOL
+    advapi.ControlService.argtypes = [wt.HANDLE, wt.DWORD, ctypes.c_void_p]
+    advapi.ControlService.restype = wt.BOOL
+    advapi.StartServiceW.argtypes = [wt.HANDLE, wt.DWORD, ctypes.c_void_p]
+    advapi.StartServiceW.restype = wt.BOOL
+    return advapi
 
 
-def _start_audio_services() -> None:
-    _run_hidden(["net", "start", "AudioEndpointBuilder"])
-    _run_hidden(["net", "start", "Audiosrv"])
+def _query_service_state(advapi, svc: wt.HANDLE) -> int:
+    ssp = _SERVICE_STATUS_PROCESS()
+    needed = wt.DWORD()
+    if not advapi.QueryServiceStatusEx(
+        svc, _SC_STATUS_PROCESS_INFO, ctypes.byref(ssp), ctypes.sizeof(ssp), ctypes.byref(needed),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(ssp.dwCurrentState)
+
+
+def _wait_service_state(advapi, svc: wt.HANDLE, target_state: int, timeout_s: float = 15.0) -> None:
+    deadline = time.perf_counter() + timeout_s
+    while True:
+        if _query_service_state(advapi, svc) == target_state:
+            return
+        if time.perf_counter() >= deadline:
+            raise TimeoutError(f"Timed out waiting for Audiosrv state {target_state}")
+        time.sleep(0.05)
+
+
+def _stop_audiosrv(timeout_s: float = 15.0) -> None:
+    advapi = _scm_advapi()
+    scm = advapi.OpenSCManagerW(None, None, _SC_MANAGER_CONNECT)
+    if not scm:
+        raise ctypes.WinError(ctypes.get_last_error())
+    svc = None
+    try:
+        svc = advapi.OpenServiceW(scm, "Audiosrv", _SERVICE_QUERY_STATUS | _SERVICE_STOP)
+        if not svc:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if _query_service_state(advapi, svc) == _SERVICE_STOPPED:
+            return
+        ssp = _SERVICE_STATUS_PROCESS()
+        if not advapi.ControlService(svc, _SERVICE_CONTROL_STOP, ctypes.byref(ssp)):
+            err = ctypes.get_last_error()
+            if err != _ERROR_SERVICE_NOT_ACTIVE:
+                raise ctypes.WinError(err)
+        _wait_service_state(advapi, svc, _SERVICE_STOPPED, timeout_s=timeout_s)
+    finally:
+        if svc:
+            advapi.CloseServiceHandle(svc)
+        advapi.CloseServiceHandle(scm)
+
+
+def _start_audiosrv(timeout_s: float = 15.0) -> None:
+    advapi = _scm_advapi()
+    scm = advapi.OpenSCManagerW(None, None, _SC_MANAGER_CONNECT)
+    if not scm:
+        raise ctypes.WinError(ctypes.get_last_error())
+    svc = None
+    try:
+        svc = advapi.OpenServiceW(scm, "Audiosrv", _SERVICE_QUERY_STATUS | _SERVICE_START)
+        if not svc:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if _query_service_state(advapi, svc) == _SERVICE_RUNNING:
+            return
+        if not advapi.StartServiceW(svc, 0, None):
+            err = ctypes.get_last_error()
+            if err != _ERROR_SERVICE_ALREADY_RUNNING:
+                raise ctypes.WinError(err)
+        _wait_service_state(advapi, svc, _SERVICE_RUNNING, timeout_s=timeout_s)
+    finally:
+        if svc:
+            advapi.CloseServiceHandle(svc)
+        advapi.CloseServiceHandle(scm)
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_install_up_to_date(src_dll: Path) -> bool:
+    expected_ring_bytes = HEADER_BYTES + RING_CAPACITY * 4
+    if not DATA_DIR.is_dir() or not RING_PATH.is_file() or not INSTALL_DLL.is_file():
+        return False
+    try:
+        if RING_PATH.stat().st_size != expected_ring_bytes:
+            return False
+        return _sha256_file(src_dll) == _sha256_file(INSTALL_DLL)
+    except OSError:
+        return False
 
 
 def _harden_dll_acls() -> None:
@@ -423,9 +566,22 @@ def _backup_endpoint(endpoint_guid: str, fx: _BackupKey) -> dict:
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, ep_state_path, 0, winreg.KEY_READ) as ek:
             raw_json, _ = winreg.QueryValueEx(ek, "BackupJson")
-            return json.loads(raw_json)
-    except OSError:
+            data = json.loads(raw_json)
+            if isinstance(data, dict):
+                return data
+    except (OSError, json.JSONDecodeError):
         pass
+
+    bak_file = DATA_DIR / f"backup_{endpoint_guid}.json"
+    if bak_file.is_file():
+        try:
+            data = json.loads(bak_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, ep_state_path, 0, winreg.KEY_WRITE) as ek:
+                    winreg.SetValueEx(ek, "BackupJson", 0, winreg.REG_SZ, json.dumps(data))
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
 
     tracked = (
         PKEY_FX_EFX, PKEY_FX_SFX, PKEY_FX_LFX, PKEY_FX_GFX,
@@ -497,10 +653,19 @@ def _merge_modes(existing: object) -> list[str]:
     return modes
 
 
-def _write_slot(endpoint_guid: str, slot: int) -> str:
+def _write_slot(endpoint_guid: str, slot: int, notes: Optional[list[str]] = None) -> str:
     fx_path = rf"{CAPTURE_ROOT}\{endpoint_guid}\FxProperties"
     with _BackupKey(fx_path, create=True) as fx:
         _backup_endpoint(endpoint_guid, fx)
+
+        # Auto-enable Windows Audio Enhancements if currently disabled (original value is backed up)
+        cur_dis = fx.get(PKEY_DISABLE_SYSFX)
+        if cur_dis is not None and isinstance(cur_dis[0], int) and cur_dis[0] != 0:
+            fx.set(PKEY_DISABLE_SYSFX, winreg.REG_DWORD, 0)
+            if notes is not None:
+                notes.append(
+                    f"INFO: Auto-enabled Windows Audio Enhancements (Disable_SysFx: {cur_dis[0]} -> 0)"
+                )
 
         # Ensure FxAssociation exists on mics that had no FxProperties key originally
         if fx.get(PKEY_FX_ASSOC) is None:
@@ -550,7 +715,11 @@ def _write_slot(endpoint_guid: str, slot: int) -> str:
         return "SFX"
 
 
-def install_apo(endpoint_guid: str) -> str:
+def install_apo(
+    endpoint_guid: str,
+    timings_ms: Optional[dict[str, float]] = None,
+    notes: Optional[list[str]] = None,
+) -> str:
     if not is_admin():
         raise PermissionError("Administrator privileges required to install Direct Mic APO.")
     src_dll = find_source_dll()
@@ -558,19 +727,59 @@ def install_apo(endpoint_guid: str) -> str:
         raise FileNotFoundError("clipmic_apo.dll not found. Reinstall ClipMic or build native/directmic/clipmic_apo.dll.")
 
     _enable_privileges("SeBackupPrivilege", "SeRestorePrivilege")
-    _ensure_data_dir_and_ring()
+    t_total = time.perf_counter()
 
-    # Stop BOTH Audiosrv and AudioEndpointBuilder BEFORE copying DLL and editing FxProperties
+    t0 = time.perf_counter()
+    up_to_date = _is_install_up_to_date(src_dll)
+    if timings_ms is not None:
+        timings_ms["hash_check_ms"] = (time.perf_counter() - t0) * 1000.0
+
+    if not up_to_date:
+        t0 = time.perf_counter()
+        _ensure_data_dir_and_ring()
+        if timings_ms is not None:
+            timings_ms["ensure_dir_ring_ms"] = (time.perf_counter() - t0) * 1000.0
+    elif timings_ms is not None:
+        timings_ms["ensure_dir_ring_ms"] = 0.0
+
+    # Stop Audiosrv BEFORE copying DLL (if needed) and editing FxProperties
     slot_used = "EFX"
     try:
-        _stop_audio_services()
-        if src_dll.resolve() != INSTALL_DLL.resolve():
-            shutil.copy2(src_dll, INSTALL_DLL)
-        _harden_dll_acls()
+        t0 = time.perf_counter()
+        _stop_audiosrv()
+        if timings_ms is not None:
+            timings_ms["stop_audiosrv_ms"] = (time.perf_counter() - t0) * 1000.0
+
+        if not up_to_date:
+            t0 = time.perf_counter()
+            if src_dll.resolve() != INSTALL_DLL.resolve():
+                shutil.copy2(src_dll, INSTALL_DLL)
+            if timings_ms is not None:
+                timings_ms["copy_dll_ms"] = (time.perf_counter() - t0) * 1000.0
+
+            t0 = time.perf_counter()
+            _harden_dll_acls()
+            if timings_ms is not None:
+                timings_ms["icacls_dll_ms"] = (time.perf_counter() - t0) * 1000.0
+        elif timings_ms is not None:
+            timings_ms["copy_dll_ms"] = 0.0
+            timings_ms["icacls_dll_ms"] = 0.0
+
+        t0 = time.perf_counter()
         _register_com()
-        slot_used = _write_slot(endpoint_guid, EFX)
+        if timings_ms is not None:
+            timings_ms["register_com_ms"] = (time.perf_counter() - t0) * 1000.0
+
+        t0 = time.perf_counter()
+        slot_used = _write_slot(endpoint_guid, EFX, notes=notes)
+        if timings_ms is not None:
+            timings_ms["write_slot_ms"] = (time.perf_counter() - t0) * 1000.0
     finally:
-        _start_audio_services()
+        t0 = time.perf_counter()
+        _start_audiosrv()
+        if timings_ms is not None:
+            timings_ms["start_audiosrv_ms"] = (time.perf_counter() - t0) * 1000.0
+            timings_ms["total_ms"] = (time.perf_counter() - t_total) * 1000.0
 
     return slot_used
 
@@ -675,11 +884,17 @@ def _load_backup(guid: str) -> dict:
     return {}
 
 
-def uninstall_apo(endpoint_guid: Optional[str] = None, *, restore_all: bool = False) -> int:
+def uninstall_apo(
+    endpoint_guid: Optional[str] = None,
+    *,
+    restore_all: bool = False,
+    timings_ms: Optional[dict[str, float]] = None,
+) -> int:
     if not is_admin():
         raise PermissionError("Administrator privileges required to restore microphone settings.")
 
     _enable_privileges("SeBackupPrivilege", "SeRestorePrivilege")
+    t_total = time.perf_counter()
     all_affected = _collect_all_affected_endpoints()
     if restore_all or not endpoint_guid:
         targets = all_affected
@@ -688,7 +903,12 @@ def uninstall_apo(endpoint_guid: Optional[str] = None, *, restore_all: bool = Fa
 
     restored_count = 0
     try:
-        _stop_audio_services()
+        t0 = time.perf_counter()
+        _stop_audiosrv()
+        if timings_ms is not None:
+            timings_ms["stop_audiosrv_ms"] = (time.perf_counter() - t0) * 1000.0
+
+        t0 = time.perf_counter()
         for guid in targets:
             ep_state_path = rf"{ENDPOINTS_KEY}\{guid}"
             backup = _load_backup(guid)
@@ -720,6 +940,19 @@ def uninstall_apo(endpoint_guid: Optional[str] = None, *, restore_all: bool = Fa
                                 else:
                                     fx.set(prop, cur[1], cleaned)
                         restored_count += 1
+                    elif backup:
+                        dis_info = backup.get(PKEY_DISABLE_SYSFX)
+                        if isinstance(dis_info, dict) and dis_info.get("existed"):
+                            orig_val = dis_info.get("value")
+                            cur_dis = fx.get(PKEY_DISABLE_SYSFX)
+                            if (
+                                isinstance(orig_val, int)
+                                and orig_val != 0
+                                and cur_dis is not None
+                                and cur_dis[0] == 0
+                            ):
+                                fx.set(PKEY_DISABLE_SYSFX, int(dis_info["type"]), orig_val)
+                                restored_count += 1
                 if backup.get("__fx_created__", {}).get("value"):
                     _delete_key_if_empty(fx_path)
             except OSError:
@@ -743,18 +976,24 @@ def uninstall_apo(endpoint_guid: Optional[str] = None, *, restore_all: bool = Fa
                     INSTALL_DLL.unlink()
                 except OSError:
                     ctypes.windll.kernel32.MoveFileExW(str(INSTALL_DLL), None, 0x4)
+        if timings_ms is not None:
+            timings_ms["restore_reg_ms"] = (time.perf_counter() - t0) * 1000.0
     finally:
-        _start_audio_services()
+        t0 = time.perf_counter()
+        _start_audiosrv()
+        if timings_ms is not None:
+            timings_ms["start_audiosrv_ms"] = (time.perf_counter() - t0) * 1000.0
+            timings_ms["total_ms"] = (time.perf_counter() - t_total) * 1000.0
     return restored_count
 
 
-def restore_all_mics() -> int:
+def restore_all_mics(timings_ms: Optional[dict[str, float]] = None) -> int:
     """Safety fallback: restore every backed-up or modified microphone (even if unplugged/renamed)."""
-    return uninstall_apo(None, restore_all=True)
+    return uninstall_apo(None, restore_all=True, timings_ms=timings_ms)
 
 
-def launch_elevated(action: str, endpoint_guid: Optional[str] = None) -> bool:
-    """Trigger silent UAC elevation via main.py CLI flags (works in both dev Python and frozen .exe)."""
+def launch_elevated(action: str, endpoint_guid: Optional[str] = None) -> tuple[Optional[int], bool]:
+    """Trigger silent UAC elevation via ShellExecuteExW and return (hProcess, cancelled)."""
     log_path = setup_log_path()
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -789,8 +1028,32 @@ def launch_elevated(action: str, endpoint_guid: Optional[str] = None) -> bool:
         args = [str(main_py), *cli_args]
 
     params = subprocess.list2cmdline(args)
-    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", launcher, params, None, 0)
-    return int(rc) > 32
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    sei.fMask = _SEE_MASK_NOCLOSEPROCESS
+    sei.lpVerb = "runas"
+    sei.lpFile = launcher
+    sei.lpParameters = params
+    sei.nShow = 0
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    shell32.ShellExecuteExW.restype = wt.BOOL
+
+    if not shell32.ShellExecuteExW(ctypes.byref(sei)):
+        err = ctypes.get_last_error()
+        if err == _ERROR_CANCELLED:
+            return None, True
+        raise ctypes.WinError(err)
+
+    return (int(sei.hProcess) if sei.hProcess else None), False
+
+
+def _format_timings(timings_ms: dict[str, float]) -> str:
+    if not timings_ms:
+        return ""
+    parts = [f"{k}={v:.1f}ms" for k, v in timings_ms.items()]
+    return "TIMING: " + " ".join(parts)
 
 
 def run_cli_action(action: str, endpoint_guid: Optional[str] = None, log_file: Optional[Path] = None) -> int:
@@ -800,29 +1063,39 @@ def run_cli_action(action: str, endpoint_guid: Optional[str] = None, log_file: O
     if cmd == "status":
         print(json.dumps(get_status(endpoint_guid), indent=2))
         return 0
+    timings_ms: dict[str, float] = {}
+    notes: list[str] = []
     try:
         if cmd == "install":
             if not endpoint_guid:
                 raise ValueError("endpoint_guid required for install")
-            slot = install_apo(endpoint_guid)
+            slot = install_apo(endpoint_guid, timings_ms=timings_ms, notes=notes)
             msg = f"OK: Installed ClipMic APO ({slot}) on {endpoint_guid}"
         elif cmd == "uninstall":
-            uninstall_apo(endpoint_guid)
+            uninstall_apo(endpoint_guid, timings_ms=timings_ms)
             msg = "OK: Restored microphone settings and removed ClipMic APO"
         elif cmd == "restore-all":
-            count = restore_all_mics()
+            count = restore_all_mics(timings_ms=timings_ms)
             msg = f"OK: Restored all microphones ({count} endpoint(s)) and removed ClipMic APO"
         else:
             raise ValueError(f"Unknown APO command: {cmd}")
+        timing_line = _format_timings(timings_ms)
+        log_lines = [msg, *notes]
+        if timing_line:
+            log_lines.append(timing_line)
+        log_body = "\n".join(log_lines) + "\n"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(msg + "\n", encoding="utf-8")
-        print(msg)
+        log_path.write_text(log_body, encoding="utf-8")
+        for line in log_lines:
+            print(line)
         return 0
     except Exception as exc:
         import traceback
         try:
+            timing_line = _format_timings(timings_ms)
+            extra = f"\n{timing_line}" if timing_line else ""
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text(f"ERROR: {exc}\n{traceback.format_exc()}", encoding="utf-8")
+            log_path.write_text(f"ERROR: {exc}{extra}\n{traceback.format_exc()}", encoding="utf-8")
         except OSError:
             pass
         print(f"ERROR: {exc}", file=sys.stderr)

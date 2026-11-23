@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-from PySide6.QtCore import QObject, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,10 +23,13 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProxyStyle,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -69,7 +72,7 @@ from hotkeys import (
     resolve_clip_path,
     save_config,
 )
-from i18n import get_lang, is_rtl, ltr, set_lang, t
+from i18n import get_lang, is_rtl, localize_effect_name, ltr, set_lang, t
 from mic_inject import MicInjector, list_microphones
 
 DARK_QSS = """
@@ -86,20 +89,28 @@ QCheckBox {
     spacing: 6px;
     color: #D4D4D8;
 }
-QCheckBox::indicator {
-    width: 15px;
-    height: 15px;
-    border-radius: 4px;
-    border: 1px solid #3A3A42;
-    background-color: #161619;
-}
-QCheckBox::indicator:checked {
-    background-color: #E4E4E7;
-    border-color: #E4E4E7;
-}
 QFrame#Card {
     background-color: #141417;
-    border: 1px solid #25252B;
+    border: 1px solid #22222A;
+    border-radius: 10px;
+}
+QPushButton#SectionToggle {
+    background-color: transparent;
+    color: #9CA3AF;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QPushButton#SectionToggle:hover {
+    background-color: #141419;
+    border-color: #22222A;
+    color: #E4E4E7;
+}
+QFrame#EmptyStateCard {
+    background-color: #111115;
+    border: 1px dashed #2A2A34;
     border-radius: 10px;
 }
 QPushButton {
@@ -177,9 +188,9 @@ QPushButton#PresetBtn {
     color: #D4D4D8;
 }
 QPushButton#PresetBtn:checked {
-    background-color: #F4F4F5;
-    border-color: #F4F4F5;
-    color: #0B0B0C;
+    background-color: #2B4236;
+    border: 1px solid #5D9173;
+    color: #E6F2EC;
     font-weight: 700;
 }
 QPushButton#ChangeChannelsBtn {
@@ -282,6 +293,65 @@ QToolTip {
     font-size: 12px;
 }
 """
+
+
+class _ClipMicStyle(QProxyStyle):
+    """Draw crisp dark checkboxes with a clear border and vector checkmark."""
+
+    def pixelMetric(self, metric, option=None, widget=None) -> int:
+        if metric in (
+            QStyle.PixelMetric.PM_IndicatorWidth,
+            QStyle.PixelMetric.PM_IndicatorHeight,
+        ):
+            return 16
+        return super().pixelMetric(metric, option, widget)
+
+    def drawPrimitive(self, element, option, painter, widget=None) -> None:
+        if element == QStyle.PrimitiveElement.PE_IndicatorCheckBox:
+            rect = QRectF(option.rect).adjusted(1.0, 1.0, -1.0, -1.0)
+            enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+            checked = bool(option.state & QStyle.StateFlag.State_On)
+            hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if not enabled:
+                fill = QColor("#151518")
+                border = QColor("#25252C")
+            elif checked:
+                fill = QColor("#2B4236")
+                border = QColor("#6EA685" if hovered else "#558A6C")
+            else:
+                fill = QColor("#1C1C22" if hovered else "#161619")
+                border = QColor("#565666" if hovered else "#3A3A44")
+
+            painter.setBrush(fill)
+            painter.setPen(QPen(border, 1.4 if checked else 1.1))
+            painter.drawRoundedRect(rect, 4.0, 4.0)
+
+            if checked:
+                ck_pen = QPen(QColor("#E6F2EC" if enabled else "#6B7280"), 1.8)
+                ck_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                ck_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(ck_pen)
+                x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+                painter.drawLine(
+                    QPointF(x + w * 0.24, y + h * 0.52),
+                    QPointF(x + w * 0.44, y + h * 0.72),
+                )
+                painter.drawLine(
+                    QPointF(x + w * 0.44, y + h * 0.72),
+                    QPointF(x + w * 0.78, y + h * 0.30),
+                )
+            painter.restore()
+            return
+        super().drawPrimitive(element, option, painter, widget)
+
+
+def _install_app_style() -> None:
+    app = QApplication.instance()
+    if app is not None and not isinstance(app.style(), _ClipMicStyle):
+        app.setStyle(_ClipMicStyle(app.style()))
 
 
 def apply_dark_titlebar(widget: QWidget, bg_hex: str = "#0B0B0C") -> None:
@@ -842,12 +912,20 @@ class EffectBuilderDialog(QDialog):
             self._editing_builtin = bool(effect.get("builtin", False))
             title_txt = t("builder.title_edit")
             init_name = str(effect.get("name", ""))
+            disp_name = localize_effect_name(self._editing_id, init_name)
+            hdr_txt = f"{title_txt} — {disp_name}" if disp_name and disp_name != init_name else title_txt
         elif effect and duplicate:
             title_txt = t("builder.title_duplicate")
-            init_name = t("builder.copy_suffix", name=effect.get("name", "Effect"))
+            src_disp = localize_effect_name(
+                str(effect.get("id", "") or "") or None,
+                str(effect.get("name", "Effect")),
+            )
+            init_name = t("builder.copy_suffix", name=src_disp)
+            hdr_txt = title_txt
         else:
             title_txt = t("builder.title_new")
             init_name = ""
+            hdr_txt = title_txt
 
         init_params = normalize_params(effect.get("params") if effect else None)
         init_custom = str(effect.get("custom_filter", "") or "") if effect else ""
@@ -862,7 +940,7 @@ class EffectBuilderDialog(QDialog):
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(10)
 
-        hdr = QLabel(title_txt)
+        hdr = QLabel(hdr_txt)
         hdr.setStyleSheet("font-size: 15px; font-weight: 700; color: #F9FAFB;")
         root.addWidget(hdr)
 
@@ -1306,7 +1384,8 @@ class ManageEffectsDialog(QDialog):
             info.setSpacing(2)
             top_line = QHBoxLayout()
             top_line.setSpacing(6)
-            name_lbl = QLabel(fx["name"])
+            disp_name = localize_effect_name(fx["id"], fx["name"])
+            name_lbl = QLabel(disp_name)
             name_lbl.setAlignment(_text_align())
             name_lbl.setStyleSheet("font-weight: 700; font-size: 13px; color: #F4F4F5;")
             tag_txt = (
@@ -1341,7 +1420,7 @@ class ManageEffectsDialog(QDialog):
                 del_btn = QPushButton("✕")
                 del_btn.setObjectName("Danger")
                 del_btn.setMinimumWidth(32)
-                del_btn.setToolTip(t("manage_fx.delete_tooltip", name=fx["name"]))
+                del_btn.setToolTip(t("manage_fx.delete_tooltip", name=disp_name))
                 del_btn.clicked.connect(lambda _=False, e=fx: self._on_delete(e))
                 row.addWidget(edit_btn)
                 row.addWidget(dup_btn)
@@ -1367,7 +1446,8 @@ class ManageEffectsDialog(QDialog):
 
                 info = QVBoxLayout()
                 info.setSpacing(2)
-                name_lbl = QLabel(fx["name"])
+                disp_name = localize_effect_name(fx["id"], fx["name"])
+                name_lbl = QLabel(disp_name)
                 name_lbl.setAlignment(_text_align())
                 name_lbl.setStyleSheet("font-weight: 600; font-size: 13px; color: #D4D4D8;")
                 desc_lbl = QLabel(_describe_effect(fx))
@@ -1379,7 +1459,7 @@ class ManageEffectsDialog(QDialog):
 
                 add_btn = QPushButton(t("manage_fx.add_btn"))
                 add_btn.setObjectName("Accent")
-                add_btn.setToolTip(t("manage_fx.add_tooltip", name=fx["name"]))
+                add_btn.setToolTip(t("manage_fx.add_tooltip", name=disp_name))
                 add_btn.clicked.connect(lambda _=False, eid=fx["id"]: self._on_add_library(eid))
                 row.addWidget(add_btn)
 
@@ -1422,10 +1502,11 @@ class ManageEffectsDialog(QDialog):
         self._open_builder(effect=fx, duplicate=True)
 
     def _on_delete(self, fx: dict) -> None:
+        disp_name = localize_effect_name(fx["id"], fx["name"])
         ans = QMessageBox.question(
             self,
             t("manage_fx.delete_confirm_title"),
-            t("manage_fx.delete_confirm_body", name=fx["name"]),
+            t("manage_fx.delete_confirm_body", name=disp_name),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -2109,7 +2190,7 @@ class TrimDialog(QDialog):
         self._effect_combo.blockSignals(True)
         self._effect_combo.clear()
         for fx in self._effects:
-            self._effect_combo.addItem(fx["name"], fx["id"])
+            self._effect_combo.addItem(localize_effect_name(fx["id"], fx["name"]), fx["id"])
         cidx = self._effect_combo.findData(target_id)
         self._effect_combo.setCurrentIndex(cidx if cidx >= 0 else 0)
         self._effect_combo.blockSignals(False)
@@ -2129,7 +2210,7 @@ class TrimDialog(QDialog):
             if fx not in picks:
                 picks.append(fx)
         for fx in picks[:5]:
-            btn = QPushButton(fx["name"])
+            btn = QPushButton(localize_effect_name(fx["id"], fx["name"]))
             btn.setObjectName("PresetBtn")
             btn.setCheckable(True)
             btn.setChecked(fx["id"] == self._current_effect_id)
@@ -2655,12 +2736,26 @@ class MainWindow(QMainWindow):
         self.resize(780, 700)
         self.setMinimumSize(700, 580)
         self.setAcceptDrops(True)
+        _install_app_style()
         self.setStyleSheet(DARK_QSS)
 
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(16, 14, 16, 12)
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._content_container = QWidget()
+        self._content_container.setMaximumWidth(920)
+        self._content_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        outer.addStretch(0)
+        outer.addWidget(self._content_container, 1)
+        outer.addStretch(0)
+
+        root = QVBoxLayout(self._content_container)
+        root.setContentsMargins(18, 16, 18, 12)
         root.setSpacing(10)
 
         # Header & Live Status Badge
@@ -2669,7 +2764,7 @@ class MainWindow(QMainWindow):
         brand.setStyleSheet("font-size: 20px; font-weight: 800; color: #F9FAFB;")
         self._status_pill = QLabel()
         self._status_pill.setStyleSheet(
-            "background: #172554; color: #93C5FD; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;"
+            "background: #172554; color: #93C5FD; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
         )
         top.addWidget(brand)
         top.addSpacing(8)
@@ -2721,6 +2816,25 @@ class MainWindow(QMainWindow):
         cap_lay.addWidget(self._stop_hk_lbl)
         cap_lay.addWidget(self._stop_hotkey_btn)
         root.addWidget(cap_card)
+
+        # Collapsible Audio & Capture Settings Toggle Bar
+        toggle_row = QHBoxLayout()
+        toggle_row.setContentsMargins(0, 0, 0, 0)
+        self._setup_toggle_btn = QPushButton(t("main.setup_toggle_expanded"))
+        self._setup_toggle_btn.setObjectName("SectionToggle")
+        self._setup_toggle_btn.setCheckable(True)
+        self._setup_toggle_btn.setChecked(True)
+        self._setup_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._setup_toggle_btn.setToolTip(t("main.setup_toggle_tooltip"))
+        self._setup_toggle_btn.toggled.connect(self._on_setup_section_toggled)
+        toggle_row.addWidget(self._setup_toggle_btn)
+        toggle_row.addStretch()
+        root.addLayout(toggle_row)
+
+        self._setup_section = QWidget()
+        setup_lay = QVBoxLayout(self._setup_section)
+        setup_lay.setContentsMargins(0, 0, 0, 0)
+        setup_lay.setSpacing(10)
 
         # Microphone, Direct Mic APO & Dual Volume Mixer
         ctrl_card = QFrame()
@@ -2803,7 +2917,7 @@ class MainWindow(QMainWindow):
         mix_row.addWidget(self._vol_slider, 1)
         mix_row.addWidget(self._vol_lbl)
         ctrl_outer.addLayout(mix_row)
-        root.addWidget(ctrl_card)
+        setup_lay.addWidget(ctrl_card)
 
         # Listening Source & Discord Toggle
         listen_card = QFrame()
@@ -2873,7 +2987,8 @@ class MainWindow(QMainWindow):
         self._listening_label.setAlignment(_text_align())
         self._listening_label.setStyleSheet("color: #9CA3AF; font-size: 12px;")
         listen_outer.addWidget(self._listening_label)
-        root.addWidget(listen_card)
+        setup_lay.addWidget(listen_card)
+        root.addWidget(self._setup_section)
 
         # Compact Drag-and-Drop Audio/Video File Import Zone
         self._drop_zone = _AudioDropZone()
@@ -2938,8 +3053,8 @@ class MainWindow(QMainWindow):
         self.retranslate_ui()
 
         self._session_timer = QTimer(self)
+        self._session_timer.setInterval(1500)
         self._session_timer.timeout.connect(self._refresh_listening)
-        self._session_timer.start(1500)
         QTimer.singleShot(0, self._start_device_scan)
 
     def _on_toggle_language(self) -> None:
@@ -2954,6 +3069,12 @@ class MainWindow(QMainWindow):
         self.setLayoutDirection(direction)
         self.retranslate_ui()
         self.language_changed.emit(new_lang)
+
+    def _on_setup_section_toggled(self, expanded: bool) -> None:
+        self._setup_section.setVisible(bool(expanded))
+        self._setup_toggle_btn.setText(
+            t("main.setup_toggle_expanded") if expanded else t("main.setup_toggle_collapsed")
+        )
 
     def _default_mic_item_text(self) -> str:
         if not self._devices_scanned:
@@ -2978,6 +3099,13 @@ class MainWindow(QMainWindow):
         self._stop_hotkey_btn.setToolTip(t("main.stop_hk_tooltip"))
         self._cap_hotkey_btn.retranslate_ui()
         self._stop_hotkey_btn.retranslate_ui()
+
+        self._setup_toggle_btn.setText(
+            t("main.setup_toggle_expanded")
+            if self._setup_toggle_btn.isChecked()
+            else t("main.setup_toggle_collapsed")
+        )
+        self._setup_toggle_btn.setToolTip(t("main.setup_toggle_tooltip"))
 
         self._mic_lbl.setText(t("main.mic_label"))
         self._mic_combo.setToolTip(t("main.mic_combo_tooltip"))
@@ -3086,11 +3214,36 @@ class MainWindow(QMainWindow):
             self._ring.set_mic_device(self._mic_combo.currentData())
         self._refresh_status()
 
+    def _pause_ui_timers(self) -> None:
+        if self._session_timer.isActive():
+            self._session_timer.stop()
+
+    def _resume_ui_timers(self) -> None:
+        if not self.isVisible() or self.isMinimized():
+            return
+        self._refresh_listening()
+        self._refresh_status()
+        if not self._session_timer.isActive():
+            self._session_timer.start()
+
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if not getattr(self, "_dark_titlebar_applied", False):
             self._dark_titlebar_applied = True
             apply_dark_titlebar(self)
+        self._resume_ui_timers()
+
+    def hideEvent(self, event) -> None:
+        self._pause_ui_timers()
+        super().hideEvent(event)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                self._pause_ui_timers()
+            elif self.isVisible():
+                self._resume_ui_timers()
 
     def shutdown(self) -> None:
         """Stop timers, background scan/decode threads, and any open capture/trim popups cleanly."""
@@ -3337,7 +3490,11 @@ class MainWindow(QMainWindow):
             self._listening_label.setStyleSheet("color: #F87171; font-size: 12px;")
             return
         apps = self._ring.refresh_active_sessions()
-        dev_short = (self._ring.device_name or t("main.loopback_default")).replace(" [Loopback]", "")
+        raw_dev = (self._ring.device_name or "").replace(" [Loopback]", "")
+        if getattr(self._ring, "mode", "") == "procloop" or raw_dev == "Per-App Capture (All Outputs)":
+            dev_short = t("main.mode_per_app_outputs")
+        else:
+            dev_short = raw_dev or t("main.loopback_default")
         inc_discord = self._discord_chk.isChecked()
         visible_apps = apps if inc_discord else [a for a in apps if a.lower() != "discord"]
         discord_paused = (not inc_discord) and bool(apps) and not visible_apps
@@ -3378,7 +3535,7 @@ class MainWindow(QMainWindow):
             self._status_pill.setText(t("main.status_pill", buf_state=buf_state, mode_state=t("main.enhancements_off")))
             self._status_pill.setToolTip(t("main.enhancements_off_tooltip"))
             self._status_pill.setStyleSheet(
-                "background: #3B2711; color: #FBBF24; border: 1px solid #6B441A; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;"
+                "background: #3B2711; color: #FBBF24; border: 1px solid #6B441A; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
             )
         else:
             apo_label = t("main.apo_active") if self._injector.apo_installed else t("main.apo_preview_mode")
@@ -3386,11 +3543,11 @@ class MainWindow(QMainWindow):
             self._status_pill.setToolTip("")
             if self._injector.apo_installed:
                 self._status_pill.setStyleSheet(
-                    "background: #1E2E24; color: #9FC5AA; border: 1px solid #2F4A38; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;"
+                    "background: #1E2E24; color: #9FC5AA; border: 1px solid #2F4A38; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
                 )
             else:
                 self._status_pill.setStyleSheet(
-                    "background: #1C1C21; color: #A1A1AA; border: 1px solid #2C2C34; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;"
+                    "background: #1C1C21; color: #A1A1AA; border: 1px solid #2C2C34; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
                 )
 
         if self._injector.apo_installed:
@@ -3409,7 +3566,11 @@ class MainWindow(QMainWindow):
         self._apo_btn.style().polish(self._apo_btn)
 
         # Update compact live status bar at bottom
-        cap_dev = (self._ring.device_name or t("main.loopback_default")).replace(" [Loopback]", "")
+        raw_cap_dev = (self._ring.device_name or "").replace(" [Loopback]", "")
+        if getattr(self._ring, "mode", "") == "procloop" or raw_cap_dev == "Per-App Capture (All Outputs)":
+            cap_dev = t("main.mode_per_app_outputs")
+        else:
+            cap_dev = raw_cap_dev or t("main.loopback_default")
         mic_label = self._mic_combo.currentText() or t("main.mic_default")
         if len(mic_label) > 36:
             mic_label = mic_label[:35] + "…"
@@ -3918,11 +4079,17 @@ class MainWindow(QMainWindow):
         if not self._clips:
             cap_hk = self._config.get("capture_hotkey", "F9")
             secs = self._buffer_seconds()
+            empty_card = QFrame()
+            empty_card.setObjectName("EmptyStateCard")
+            empty_lay = QVBoxLayout(empty_card)
+            empty_lay.setContentsMargins(24, 32, 24, 32)
+            empty_lay.setSpacing(6)
             empty = QLabel(t("main.empty_clips", hk=ltr(cap_hk), n=secs))
-            empty.setStyleSheet("color: #71717A; padding: 24px;")
+            empty.setStyleSheet("color: #8B8B96; font-size: 13px;")
             empty.setWordWrap(True)
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._list_layout.insertWidget(0, empty)
+            empty_lay.addWidget(empty)
+            self._list_layout.insertWidget(0, empty_card)
             return
 
         for idx, clip in enumerate(self._clips):
@@ -3934,13 +4101,15 @@ class MainWindow(QMainWindow):
             )
             row = QHBoxLayout(card)
             row.setContentsMargins(12, 10, 12, 10)
+            row.setSpacing(8)
 
             info = QVBoxLayout()
             info.setSpacing(2)
             name_lbl = QLabel(clip.name)
             name_lbl.setAlignment(_text_align())
             name_lbl.setStyleSheet("font-weight: 700; font-size: 13px; color: #F4F4F5;")
-            meta_lbl = QLabel(t("main.clip_meta", dur=clip.duration, preset=clip.preset))
+            preset_disp = localize_effect_name(None, clip.preset)
+            meta_lbl = QLabel(t("main.clip_meta", dur=clip.duration, preset=preset_disp))
             meta_lbl.setAlignment(_text_align())
             meta_lbl.setStyleSheet("color: #9A9AA2; font-size: 11px;")
             info.addWidget(name_lbl)

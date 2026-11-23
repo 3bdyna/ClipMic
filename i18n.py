@@ -72,7 +72,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "tray.open": "Open ClipMic",
         "tray.clip_last": "Clip Last {n}s",
         "tray.stop_all": "Stop All Audio",
-        "tray.restore_all_mics": "Restore All Mics (Safety Reset)",
+        "tray.restore_all_mics": "Reset All Mics",
         "tray.quit": "Quit",
 
         # MainWindow header & top bar
@@ -96,13 +96,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "main.mic_default_named": "Windows Default ({name})",
         "main.mic_default": "Windows Default",
         "main.refresh_devices_tooltip": "Rescan microphones and playback capture devices",
-        "main.enable_direct_mic": "Enable Direct Mic",
-        "main.enable_direct_mic_tooltip": "Install ClipMic Direct Mic APO on the selected microphone",
-        "main.enable_direct_mic_backup_tooltip": "Direct Mic backup exists on another or unplugged mic — use tray 'Restore All Mics' to reset all.",
-        "main.restore_mic": "Restore Mic",
-        "main.restore_mic_tooltip": "Remove ClipMic Direct Mic APO and restore the microphone to its default driver",
+        "main.enable_direct_mic": "Enable Mic",
+        "main.enable_direct_mic_tooltip": "Allow ClipMic to play clips through the selected microphone",
+        "main.enable_direct_mic_backup_tooltip": "Another or unplugged mic is still linked — use tray 'Reset All Mics' to reset all.",
+        "main.restore_mic": "Disable Mic",
+        "main.restore_mic_tooltip": "Disconnect ClipMic from this microphone and return it to normal",
         "main.enabling": "Enabling...",
-        "main.restoring": "Restoring...",
+        "main.restoring": "Disabling...",
         "main.mic_vol_label": "Mic Vol:",
         "main.mic_vol_tooltip": "Mic send volume (how loud clips sound to teammates on Discord/games)",
         "main.monitor_chk": "Monitor",
@@ -122,6 +122,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "main.buffer_preset_tooltip": "Keep the last {n} seconds of audio in memory",
         "main.buffer_spin_suffix": "s",
         "main.buffer_spin_tooltip": "Custom rolling capture duration ({min}–{max} seconds)",
+        "main.setup_toggle_expanded": "Audio & Capture Settings ▾",
+        "main.setup_toggle_collapsed": "Audio & Capture Settings ▸",
+        "main.setup_toggle_tooltip": "Show or hide microphone, volume, and capture settings",
 
         # MainWindow listening & status indicators
         "main.listening_checking": "● Listening: checking active apps…",
@@ -133,15 +136,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "main.mic_buf_on": "Mic {n}s ON",
         "main.mic_buf_off": "Mic {n}s OFF",
         "main.mic_buf_unavailable": "Mic unavailable",
-        "main.mode_per_app_outputs": "Per-App (All Outputs)",
+        "main.mode_per_app_outputs": "All Apps",
         "main.buf_reconnecting": "Reconnecting…",
-        "main.buf_per_app": "Per-App Capture",
-        "main.buf_loopback": "Loopback Active",
-        "main.buf_off": "Capture Off",
-        "main.apo_active": "Direct-Mic APO Active",
-        "main.apo_preview_mode": "Speaker Preview Mode (No APO)",
-        "main.apo_active_short": "Direct Mic Active",
-        "main.apo_preview_short": "Preview-Only Mode",
+        "main.buf_per_app": "App Audio",
+        "main.buf_loopback": "System Audio",
+        "main.buf_off": "Audio Off",
+        "main.apo_active": "Mic Ready",
+        "main.apo_preview_mode": "Preview Only",
+        "main.apo_active_short": "Mic Ready",
+        "main.apo_preview_short": "Preview Only",
         "main.enhancements_off": "Audio Enhancements OFF",
         "main.enhancements_off_tooltip": "Windows Audio Enhancements are turned off for this microphone. Turn them on in Windows Sound Settings for Direct Mic to work.",
         "main.status_pill": "{buf_state} • {mode_state}",
@@ -388,7 +391,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "tray.open": "فتح ClipMic",
         "tray.clip_last": "قص آخر {n} ثانية",
         "tray.stop_all": "إيقاف كل الصوت",
-        "tray.restore_all_mics": "استعادة جميع أجهزة المايك (إعادة ضبط آمنة)",
+        "tray.restore_all_mics": "إعادة ضبط جميع المايكات",
         "tray.quit": "خروج",
 
         # MainWindow header & top bar
@@ -412,13 +415,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "main.mic_default_named": "المايك الافتراضي ({name})",
         "main.mic_default": "المايك الافتراضي",
         "main.refresh_devices_tooltip": "إعادة فحص أجهزة المايك ومصادر الصوت",
-        "main.enable_direct_mic": "تفعيل المايك المباشر",
-        "main.enable_direct_mic_tooltip": "تثبيت ميزة المايك المباشر (APO) على المايك المحدد",
-        "main.enable_direct_mic_backup_tooltip": "توجد نسخة احتياطية على مايك آخر أو غير متصل — استخدم خيار استعادة جميع أجهزة المايك من شريط النظام.",
-        "main.restore_mic": "استعادة المايك",
-        "main.restore_mic_tooltip": "إزالة ميزة المايك المباشر وإرجاع المايك إلى إعداداته الأصلية",
+        "main.enable_direct_mic": "تفعيل المايك",
+        "main.enable_direct_mic_tooltip": "السماح لتطبيق ClipMic بتشغيل المقاطع عبر المايك المحدد",
+        "main.enable_direct_mic_backup_tooltip": "يوجد مايك آخر مرتبط حالياً — استخدم خيار «إعادة ضبط جميع المايكات» من شريط النظام.",
+        "main.restore_mic": "إيقاف المايك",
+        "main.restore_mic_tooltip": "فصل ClipMic عن هذا المايك وإرجاعه لوضعه الطبيعي",
         "main.enabling": "جارٍ التفعيل...",
-        "main.restoring": "جارٍ الاستعادة...",
+        "main.restoring": "جارٍ الإيقاف...",
         "main.mic_vol_label": "صوت المايك:",
         "main.mic_vol_tooltip": "مستوى صوت المقاطع التي يسمعها الآخرون عبر المايك في ديسكورد والألعاب",
         "main.monitor_chk": "سماع الصوت",
@@ -438,6 +441,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "main.buffer_preset_tooltip": "الاحتفاظ بآخر {n} ثانية من الصوت في الذاكرة",
         "main.buffer_spin_suffix": " ث",
         "main.buffer_spin_tooltip": "مدة تسجيل مخصصة ({min}–{max} ثانية)",
+        "main.setup_toggle_expanded": "إعدادات الصوت والتسجيل ▾",
+        "main.setup_toggle_collapsed": "إعدادات الصوت والتسجيل ◂",
+        "main.setup_toggle_tooltip": "إظهار أو إخفاء إعدادات المايك ومستوى الصوت والتسجيل",
 
         # MainWindow listening & status indicators
         "main.listening_checking": "● الاستماع: جارٍ فحص التطبيقات النشطة…",
@@ -449,15 +455,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "main.mic_buf_on": "تسجيل المايك {n} ث مفعّل",
         "main.mic_buf_off": "تسجيل المايك {n} ث متوقف",
         "main.mic_buf_unavailable": "المايك غير متاح",
-        "main.mode_per_app_outputs": "حسب التطبيق (جميع المخارج)",
+        "main.mode_per_app_outputs": "جميع التطبيقات",
         "main.buf_reconnecting": "جارٍ إعادة الاتصال…",
-        "main.buf_per_app": "التقاط حسب التطبيق",
-        "main.buf_loopback": "التقاط النظام مفعّل",
+        "main.buf_per_app": "صوت التطبيقات",
+        "main.buf_loopback": "صوت النظام",
         "main.buf_off": "التسجيل متوقف",
-        "main.apo_active": "المايك المباشر مفعّل",
-        "main.apo_preview_mode": "وضع المعاينة فقط (بدون APO)",
-        "main.apo_active_short": "المايك المباشر مفعّل",
-        "main.apo_preview_short": "وضع المعاينة فقط",
+        "main.apo_active": "المايك جاهز",
+        "main.apo_preview_mode": "معاينة فقط",
+        "main.apo_active_short": "المايك جاهز",
+        "main.apo_preview_short": "معاينة فقط",
         "main.enhancements_off": "تحسينات الصوت متوقفة",
         "main.enhancements_off_tooltip": "خيار تحسينات الصوت (Audio Enhancements) متوقف لهذا المايك في ويندوز. قم بتفعيله من إعدادات الصوت ليعمل المايك المباشر.",
         "main.status_pill": "{buf_state} • {mode_state}",
@@ -687,3 +693,67 @@ def t(key: str, **kwargs: object) -> str:
         except (KeyError, ValueError, IndexError):
             return text
     return text
+
+
+_BUILTIN_EFFECT_NAMES_EN: dict[str, str] = {
+    "normal": "Normal",
+    "kid_high_pitch": "Kid / High Pitch",
+    "feminine_girl": "Feminine / Girl",
+    "nerd_nasal": "Nerd / Nasal",
+    "mocking_spongebob": "Mocking / SpongeBob",
+    "drunk_slurred": "Drunk / Slurred",
+    "lobby_mic_2009": "2009 Lobby Mic",
+    "underwater": "Underwater",
+    "cathedral_dramatic": "Cathedral / Dramatic",
+    "deep_fried_meme": "Deep-Fried / Meme",
+    "fast_yap": "Fast Yap",
+    "reverse": "Reverse",
+    "chipmunk": "Chipmunk",
+    "robot": "Robot",
+    "echo": "Echo",
+    "deep_demon": "Deep / Demon",
+    "bass_boost_loud": "Bass Boost / Loud",
+}
+
+_BUILTIN_EFFECT_NAMES_AR: dict[str, str] = {
+    "normal": "عادي",
+    "kid_high_pitch": "طفل / صوت حاد",
+    "feminine_girl": "صوت ناعم / فتاة",
+    "nerd_nasal": "صوت أنفي",
+    "mocking_spongebob": "ساخر / سبونج بوب",
+    "drunk_slurred": "مترنّح / بطيء",
+    "lobby_mic_2009": "مايك لوبي 2009",
+    "underwater": "تحت الماء",
+    "cathedral_dramatic": "كاتدرائية / درامي",
+    "deep_fried_meme": "مشوّش / ميم",
+    "fast_yap": "كلام سريع",
+    "reverse": "معكوس",
+    "chipmunk": "سنجاب",
+    "robot": "روبوت",
+    "echo": "صدى",
+    "deep_demon": "عميق / وحش",
+    "bass_boost_loud": "بيس عالي / صاخب",
+}
+
+_BUILTIN_EFFECT_ID_BY_EN: dict[str, str] = {
+    en_name.lower(): eid for eid, en_name in _BUILTIN_EFFECT_NAMES_EN.items()
+}
+
+
+def localize_effect_name(effect_id: Optional[str], name: str) -> str:
+    """Return Arabic display name for unmodified built-in effects; preserve custom/renamed names."""
+    if _current_lang != "ar":
+        return name
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        return name
+    eid = str(effect_id or "").strip()
+    if eid:
+        default_en = _BUILTIN_EFFECT_NAMES_EN.get(eid)
+        if default_en is not None and clean_name.lower() == default_en.lower():
+            return _BUILTIN_EFFECT_NAMES_AR.get(eid, name)
+        return name
+    matched_id = _BUILTIN_EFFECT_ID_BY_EN.get(clean_name.lower())
+    if matched_id is not None:
+        return _BUILTIN_EFFECT_NAMES_AR.get(matched_id, name)
+    return name

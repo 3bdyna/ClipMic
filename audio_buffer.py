@@ -175,51 +175,241 @@ def _clean_proc_name(raw: str) -> str:
     return name
 
 
-def _resolve_root_process(pid: int) -> Optional[tuple[int, str, str, str]]:
-    """Return (root_pid, app_key, friendly_name, exe_path) grouping same-exe child trees."""
-    try:
-        proc = psutil.Process(pid)
-        raw_name = proc.name()
-    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-        return None
-    if not raw_name:
-        return None
-    target_exe_low = raw_name.lower()
-    root_proc = proc
-    # Walk up ancestor chain while parent shares the exact same executable (Chrome/Discord/Electron trees)
-    for _ in range(12):
-        try:
-            parent = root_proc.parent()
-            if parent is None or parent.pid <= 0 or parent.pid == root_proc.pid:
-                break
-            if parent.name().lower() == target_exe_low:
-                root_proc = parent
+class _ProcMeta:
+    __slots__ = ("pid", "create_time", "root_pid", "app_key", "friendly", "exe_path", "has_game_dll", "last_seen_scan")
+
+    def __init__(
+        self,
+        pid: int,
+        create_time: float,
+        root_pid: int,
+        app_key: str,
+        friendly: str,
+        exe_path: str,
+        last_seen_scan: int,
+    ) -> None:
+        self.pid = pid
+        self.create_time = create_time
+        self.root_pid = root_pid
+        self.app_key = app_key
+        self.friendly = friendly
+        self.exe_path = exe_path
+        self.has_game_dll: Optional[bool] = None
+        self.last_seen_scan = last_seen_scan
+
+
+class _ProcessMetaCache:
+    """Thread-safe cache of psutil process metadata and game-DLL checks keyed by (pid, create_time)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_key: dict[tuple[int, float], _ProcMeta] = {}
+        self._pid_to_proc: dict[int, tuple[psutil.Process, float]] = {}
+        self._scan_gen: int = 0
+        self.hits: int = 0
+        self.misses: int = 0
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._by_key)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._by_key.clear()
+            self._pid_to_proc.clear()
+
+    def pid_alive(self, pid: int) -> bool:
+        with self._lock:
+            cached = self._pid_to_proc.get(pid)
+        if cached is not None:
+            proc, ct = cached
+            try:
+                if proc.is_running():
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                pass
+            with self._lock:
+                if self._pid_to_proc.get(pid) == cached:
+                    self._pid_to_proc.pop(pid, None)
+                self._by_key.pop((pid, ct), None)
+            return False
+        return bool(psutil.pid_exists(pid))
+
+    def resolve(self, pid: int) -> Optional[tuple[int, str, str, str]]:
+        """Return cached (root_pid, app_key, friendly_name, exe_path) for pid."""
+        with self._lock:
+            cached = self._pid_to_proc.get(pid)
+        if cached is not None:
+            proc, ct = cached
+            try:
+                alive = proc.is_running()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                alive = False
+            if alive:
+                with self._lock:
+                    meta = self._by_key.get((pid, ct))
+                    if meta is not None:
+                        meta.last_seen_scan = self._scan_gen
+                        self.hits += 1
+                        return meta.root_pid, meta.app_key, meta.friendly, meta.exe_path
             else:
-                break
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            break
-    exe_path = ""
-    try:
-        exe_path = root_proc.exe() or ""
-    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                with self._lock:
+                    if self._pid_to_proc.get(pid) == cached:
+                        self._pid_to_proc.pop(pid, None)
+                    self._by_key.pop((pid, ct), None)
+
         try:
-            exe_path = proc.exe() or ""
+            proc = psutil.Process(pid)
+            ct = float(proc.create_time())
+            raw_name = proc.name()
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            exe_path = ""
-    friendly = _clean_proc_name(raw_name)
-    app_key = friendly.lower()
-    return int(root_proc.pid), app_key, friendly, exe_path
+            return None
+        if not raw_name:
+            return None
+
+        target_exe_low = raw_name.lower()
+        root_proc = proc
+        # Walk up ancestor chain while parent shares the exact same executable (Chrome/Discord/Electron trees)
+        for _ in range(12):
+            try:
+                parent = root_proc.parent()
+                if parent is None or parent.pid <= 0 or parent.pid == root_proc.pid:
+                    break
+                if parent.name().lower() == target_exe_low:
+                    root_proc = parent
+                else:
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                break
+
+        exe_path = ""
+        try:
+            exe_path = root_proc.exe() or ""
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            try:
+                exe_path = proc.exe() or ""
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                exe_path = ""
+
+        friendly = _clean_proc_name(raw_name)
+        app_key = friendly.lower()
+        root_pid = int(root_proc.pid)
+
+        with self._lock:
+            old = self._pid_to_proc.get(pid)
+            if old is not None and old[1] != ct:
+                self._by_key.pop((pid, old[1]), None)
+            meta = _ProcMeta(pid, ct, root_pid, app_key, friendly, exe_path, self._scan_gen)
+            self._by_key[(pid, ct)] = meta
+            self._pid_to_proc[pid] = (proc, ct)
+            self.misses += 1
+
+        return root_pid, app_key, friendly, exe_path
+
+    def has_game_gpu_module(self, pid: int) -> bool:
+        """Cached per-(pid, create_time) check for 3D game/SDK DLLs."""
+        with self._lock:
+            cached = self._pid_to_proc.get(pid)
+        if cached is not None:
+            proc, ct = cached
+            try:
+                alive = proc.is_running()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                alive = False
+            if alive:
+                with self._lock:
+                    meta = self._by_key.get((pid, ct))
+                    if meta is not None and meta.has_game_dll is not None:
+                        meta.last_seen_scan = self._scan_gen
+                        self.hits += 1
+                        return meta.has_game_dll
+                result = _has_game_gpu_module(pid)
+                with self._lock:
+                    meta = self._by_key.get((pid, ct))
+                    if meta is not None:
+                        meta.has_game_dll = result
+                return result
+            else:
+                with self._lock:
+                    if self._pid_to_proc.get(pid) == cached:
+                        self._pid_to_proc.pop(pid, None)
+                    self._by_key.pop((pid, ct), None)
+
+        # Ensure metadata entry exists if process is accessible, then cache module check
+        self.resolve(pid)
+        with self._lock:
+            cached2 = self._pid_to_proc.get(pid)
+        result = _has_game_gpu_module(pid)
+        if cached2 is not None:
+            with self._lock:
+                meta = self._by_key.get((pid, cached2[1]))
+                if meta is not None:
+                    meta.has_game_dll = result
+        return result
+
+    def prune(self, active_pids: Optional[set[int]] = None, max_stale_scans: int = 30) -> int:
+        """Evict dead processes and entries unseen for >max_stale_scans cycles."""
+        with self._lock:
+            self._scan_gen += 1
+            cur_gen = self._scan_gen
+            snapshot_items = list(self._pid_to_proc.items())
+
+        dead_keys: list[tuple[int, float]] = []
+        for pid, (proc, ct) in snapshot_items:
+            if active_pids is not None and pid in active_pids:
+                continue
+            try:
+                alive = proc.is_running()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                alive = False
+            if not alive:
+                dead_keys.append((pid, ct))
+                continue
+            with self._lock:
+                meta = self._by_key.get((pid, ct))
+                if meta is None or (cur_gen - meta.last_seen_scan) > max_stale_scans:
+                    dead_keys.append((pid, ct))
+
+        removed = 0
+        with self._lock:
+            for pid, ct in dead_keys:
+                cur = self._pid_to_proc.get(pid)
+                if cur is not None and cur[1] == ct:
+                    self._pid_to_proc.pop(pid, None)
+                if self._by_key.pop((pid, ct), None) is not None:
+                    removed += 1
+            # Clean any orphaned keys in _by_key
+            live_keys = {(pid, ct) for pid, (_p, ct) in self._pid_to_proc.items()}
+            for k in list(self._by_key.keys()):
+                if k not in live_keys:
+                    self._by_key.pop(k, None)
+                    removed += 1
+        return removed
 
 
-def enumerate_active_audio_sessions() -> list[dict]:
+_DEFAULT_PROC_CACHE = _ProcessMetaCache()
+
+
+def _resolve_root_process(
+    pid: int,
+    proc_cache: Optional[_ProcessMetaCache] = None,
+) -> Optional[tuple[int, str, str, str]]:
+    """Return (root_pid, app_key, friendly_name, exe_path) grouping same-exe child trees."""
+    cache = proc_cache if proc_cache is not None else _DEFAULT_PROC_CACHE
+    return cache.resolve(pid)
+
+
+def enumerate_active_audio_sessions(proc_cache: Optional[_ProcessMetaCache] = None) -> list[dict]:
     """Scan ALL active Windows render endpoints (TV, HDMI, speakers, headsets) for active app sessions.
 
     Returns grouped app dicts:
       {"key": str, "name": str, "root_pids": list[int], "pids": list[int], "exe_path": str}
     ClipMic's own process is always excluded.
     """
+    cache = proc_cache if proc_cache is not None else _DEFAULT_PROC_CACHE
     my_pid = os.getpid()
     grouped: dict[str, dict] = {}
+    seen_pids: set[int] = set()
     coinit = False
     try:
         try:
@@ -250,12 +440,14 @@ def enumerate_active_audio_sessions() -> list[dict]:
                     pid = int(ctrl2.GetProcessId())
                     if pid <= 0 or pid == my_pid:
                         continue
-                    resolved = _resolve_root_process(pid)
+                    seen_pids.add(pid)
+                    resolved = _resolve_root_process(pid, proc_cache=cache)
                     if resolved is None:
                         continue
                     root_pid, app_key, friendly, exe_path = resolved
                     if root_pid == my_pid:
                         continue
+                    seen_pids.add(root_pid)
                     entry = grouped.get(app_key)
                     if entry is None:
                         grouped[app_key] = {
@@ -282,6 +474,7 @@ def enumerate_active_audio_sessions() -> list[dict]:
                 comtypes.CoUninitialize()
             except Exception:
                 pass
+    cache.prune(seen_pids)
     return list(grouped.values())
 
 
@@ -778,7 +971,7 @@ class LoopbackRingBuffer:
 CAPTURE_SAMPLE_RATE = 48000
 CAPTURE_CHANNELS = 2
 _IDLE_RELEASE_S = 60.0
-_SCAN_INTERVAL_S = 1.5
+_SCAN_INTERVAL_S = 2.2
 
 _NON_GAME_EXES: set[str] = {
     "chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "arc", "waterfox",
@@ -900,6 +1093,7 @@ def detect_channel_kind(
     *,
     foreground_fs_pid: Optional[int] = None,
     check_modules: bool = True,
+    proc_cache: Optional[_ProcessMetaCache] = None,
 ) -> str:
     """Classify a process channel as 'game' or 'app'."""
     stem = exe_name[:-4].lower() if exe_name.lower().endswith(".exe") else exe_name.lower()
@@ -919,8 +1113,9 @@ def detect_channel_kind(
         return "game"
 
     if check_modules and pids:
+        cache = proc_cache if proc_cache is not None else _DEFAULT_PROC_CACHE
         for p in pids[:2]:
-            if _has_game_gpu_module(p):
+            if cache.has_game_gpu_module(p):
                 return "game"
 
     return "app"
@@ -1055,7 +1250,7 @@ class _ProcLoopLib:
 
 
 class MicRingBuffer:
-    """Lightweight parallel 30-second shared-mode WASAPI microphone ring buffer (48 kHz stereo float32).
+    """Lightweight parallel shared-mode WASAPI microphone ring buffer (48 kHz stereo int16 internal, float32 snapshot).
 
     Never opens exclusive mode so Discord, games, and ClipMic's Direct Mic APO stay unblocked.
     Fails gracefully if no microphone is available or Windows mic permission is denied.
@@ -1070,6 +1265,8 @@ class MicRingBuffer:
         self._stream: Optional[sd.InputStream] = None
         self._running = False
         self._buf: Optional[np.ndarray] = None
+        self._f32_scratch: np.ndarray = np.empty((2048, CAPTURE_CHANNELS), dtype=np.float32)
+        self._i16_scratch: np.ndarray = np.empty((2048, CAPTURE_CHANNELS), dtype=np.int16)
         self._write_pos = 0
         self._filled = 0
         self._last_write_qpc = 0
@@ -1121,7 +1318,7 @@ class MicRingBuffer:
         try:
             dev_idx, in_ch, in_sr = self._resolve_input_device(device_name)
             with self._lock:
-                self._buf = np.zeros((self._capacity, CAPTURE_CHANNELS), dtype=np.float32)
+                self._buf = np.zeros((self._capacity, CAPTURE_CHANNELS), dtype=np.int16)
                 self._write_pos = 0
                 self._filled = 0
                 self._src_rate = in_sr
@@ -1159,14 +1356,14 @@ class MicRingBuffer:
             if new_cap == self._capacity and self._buf.shape == (new_cap, CAPTURE_CHANNELS):
                 return
             if self._filled == 0:
-                recent = np.zeros((0, CAPTURE_CHANNELS), dtype=np.float32)
+                recent = np.zeros((0, CAPTURE_CHANNELS), dtype=np.int16)
             elif self._filled < self._capacity:
                 recent = self._buf[:self._filled]
             else:
                 pos = self._write_pos
                 recent = np.concatenate((self._buf[pos:], self._buf[:pos]), axis=0)
             keep = min(len(recent), new_cap)
-            new_buf = np.zeros((new_cap, CAPTURE_CHANNELS), dtype=np.float32)
+            new_buf = np.zeros((new_cap, CAPTURE_CHANNELS), dtype=np.int16)
             if keep > 0:
                 new_buf[:keep] = recent[-keep:]
             self._buf = new_buf
@@ -1196,10 +1393,23 @@ class MicRingBuffer:
         if not self._running or frames <= 0:
             return
         arr = np.asarray(indata, dtype=np.float32)
+        in_n = len(arr)
+        if in_n <= 0:
+            return
+
+        if self._f32_scratch.shape[0] < in_n:
+            self._f32_scratch = np.empty((in_n, CAPTURE_CHANNELS), dtype=np.float32)
+            self._i16_scratch = np.empty((in_n, CAPTURE_CHANNELS), dtype=np.int16)
+
         if arr.ndim == 1:
-            stereo = np.column_stack((arr, arr))
+            stereo = self._f32_scratch[:in_n]
+            stereo[:, 0] = arr
+            stereo[:, 1] = arr
         elif arr.shape[1] == 1:
-            stereo = np.repeat(arr, 2, axis=1)
+            stereo = self._f32_scratch[:in_n]
+            mono = arr[:, 0]
+            stereo[:, 0] = mono
+            stereo[:, 1] = mono
         else:
             stereo = arr[:, :2]
 
@@ -1215,28 +1425,38 @@ class MicRingBuffer:
             )
 
         now_qpc = _query_qpc()
-        peak = float(max(abs(float(stereo.max())), abs(float(stereo.min()))))
-        if peak > 0.015:
+        if float(stereo.max()) > 0.015 or float(stereo.min()) < -0.015:
             self._last_signal_qpc = now_qpc
 
         n = len(stereo)
+        if self._f32_scratch.shape[0] < n:
+            self._f32_scratch = np.empty((n, CAPTURE_CHANNELS), dtype=np.float32)
+            self._i16_scratch = np.empty((n, CAPTURE_CHANNELS), dtype=np.int16)
+
+        fbuf = self._f32_scratch[:n]
+        np.clip(stereo, -1.0, 1.0, out=fbuf)
+        fbuf *= np.float32(32767.0)
+        np.rint(fbuf, out=fbuf)
+        i16 = self._i16_scratch[:n]
+        np.copyto(i16, fbuf, casting="unsafe")
+
         with self._lock:
             buf = self._buf
             if buf is None:
                 return
             cap = self._capacity
             if n >= cap:
-                buf[:] = stereo[-cap:]
+                buf[:] = i16[-cap:]
                 self._write_pos = 0
                 self._filled = cap
             else:
                 end = self._write_pos + n
                 if end <= cap:
-                    buf[self._write_pos:end] = stereo
+                    buf[self._write_pos:end] = i16
                 else:
                     first = cap - self._write_pos
-                    buf[self._write_pos:] = stereo[:first]
-                    buf[:n - first] = stereo[first:]
+                    buf[self._write_pos:] = i16[:first]
+                    buf[:n - first] = i16[first:]
                 self._write_pos = end % cap
                 self._filled = min(cap, self._filled + n)
             self._last_write_qpc = now_qpc
@@ -1257,11 +1477,14 @@ class MicRingBuffer:
             if buf is None or self._filled == 0:
                 return np.zeros((0, CAPTURE_CHANNELS), dtype=np.float32), CAPTURE_SAMPLE_RATE, _query_qpc(), freq
             if self._filled < self._capacity:
-                data = buf[:self._filled].copy()
+                raw = buf[:self._filled].copy()
             else:
                 pos = self._write_pos
-                data = np.concatenate((buf[pos:], buf[:pos]), axis=0)
-            return data, CAPTURE_SAMPLE_RATE, self._last_write_qpc or _query_qpc(), freq
+                raw = np.concatenate((buf[pos:], buf[:pos]), axis=0)
+            end_qpc = self._last_write_qpc or _query_qpc()
+        data = raw.astype(np.float32)
+        data *= np.float32(1.0 / 32768.0)
+        return data, CAPTURE_SAMPLE_RATE, end_qpc, freq
 
 
 def measure_channel_levels(audio_f32: np.ndarray, sample_rate: int = CAPTURE_SAMPLE_RATE) -> tuple[float, float]:
@@ -1536,6 +1759,7 @@ class MultiChannelCapture:
         self._scan_interval_s = float(scan_interval_s)
 
         self._lib = _ProcLoopLib(dll_path)
+        self._proc_cache = _ProcessMetaCache()
         self._lock = threading.Lock()
         self._channels: dict[str, _AppChannelState] = {}
         self._mic_ring = MicRingBuffer(duration_s=self.duration_s)
@@ -1698,6 +1922,7 @@ class MultiChannelCapture:
                 self._lib.destroy(h)
             ch.handles.clear()
 
+        self._proc_cache.clear()
         self._mic_ring.stop()
         if self._fallback_active:
             self._fallback_ring.stop()
@@ -1717,7 +1942,7 @@ class MultiChannelCapture:
     def _scan_once(self) -> None:
         if not self._running or not self._use_procloop:
             return
-        sessions = enumerate_active_audio_sessions()
+        sessions = enumerate_active_audio_sessions(proc_cache=self._proc_cache)
         fg_fs_pid = _get_foreground_fullscreen_pid()
         now = time.monotonic()
         active_names: list[str] = []
@@ -1742,6 +1967,7 @@ class MultiChannelCapture:
                     sess["exe_path"],
                     sess["pids"] + sess["root_pids"],
                     foreground_fs_pid=fg_fs_pid,
+                    proc_cache=self._proc_cache,
                 )
 
         if not self._running or self._stop_event.is_set():
@@ -1777,11 +2003,12 @@ class MultiChannelCapture:
                             sess["pids"] + sess["root_pids"],
                             foreground_fs_pid=fg_fs_pid,
                             check_modules=False,
+                            proc_cache=self._proc_cache,
                         )
 
                 for rpid in list(ch.handles.keys()):
                     h = ch.handles[rpid]
-                    if not self._lib.is_running(h) or not psutil.pid_exists(rpid):
+                    if not self._lib.is_running(h) or not self._proc_cache.pid_alive(rpid):
                         to_destroy.append(ch.handles.pop(rpid))
 
                 for rpid in sess["root_pids"]:
@@ -1794,7 +2021,7 @@ class MultiChannelCapture:
                     continue
                 for rpid in list(ch.handles.keys()):
                     h = ch.handles[rpid]
-                    if not self._lib.is_running(h) or not psutil.pid_exists(rpid):
+                    if not self._lib.is_running(h) or not self._proc_cache.pid_alive(rpid):
                         to_destroy.append(ch.handles.pop(rpid))
                     else:
                         ms_sig = self._lib.ms_since_signal(h)
@@ -1915,7 +2142,8 @@ class MultiChannelCapture:
         if self._fallback_active and (not self._use_procloop or not raw_items):
             fb_i16, fb_sr = self._fallback_ring.snapshot()
             if fb_i16.size > 0:
-                fb_f32 = fb_i16.astype(np.float32) / 32768.0
+                fb_f32 = fb_i16.astype(np.float32)
+                fb_f32 *= np.float32(1.0 / 32768.0)
                 if fb_f32.ndim == 1:
                     fb_f32 = np.column_stack((fb_f32, fb_f32))
                 elif fb_f32.shape[1] == 1:

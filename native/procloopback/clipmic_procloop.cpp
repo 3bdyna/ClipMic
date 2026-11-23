@@ -264,10 +264,23 @@ static uint32_t ClampCapacityFrames(double duration_s) {
     return cap;
 }
 
+static inline int16_t FloatToInt16(float s) {
+    if (!(s == s)) return 0;  // NaN guard
+    if (s >= 1.0f) return 32767;
+    if (s <= -1.0f) return -32768;
+    return static_cast<int16_t>(std::lrintf(s * 32767.0f));
+}
+
+static inline void ConvertFloatToInt16(int16_t* dst, const float* src, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        dst[i] = FloatToInt16(src[i]);
+    }
+}
+
 struct ProcLoopSession {
     DWORD pid = 0;
     uint32_t capacity_frames = 0;
-    std::vector<float> ring;  // capacity_frames * 2 interleaved stereo float32
+    std::vector<int16_t> ring;  // capacity_frames * 2 interleaved stereo int16
     uint32_t write_pos = 0;
     uint32_t filled = 0;
     int64_t last_write_qpc = 0;
@@ -283,11 +296,37 @@ struct ProcLoopSession {
     HANDLE thread = nullptr;
     HRESULT init_hr = E_FAIL;
 
-    void WriteFramesLocked(const float* stereo, uint32_t count) {
+    void WriteFramesFloatLocked(const float* stereo, uint32_t count) {
         if (count == 0 || capacity_frames == 0) return;
         if (count >= capacity_frames) {
             const float* tail = stereo + static_cast<size_t>(count - capacity_frames) * kChannels;
-            std::memcpy(ring.data(), tail, static_cast<size_t>(capacity_frames) * kChannels * sizeof(float));
+            ConvertFloatToInt16(ring.data(), tail, static_cast<size_t>(capacity_frames) * kChannels);
+            write_pos = 0;
+            filled = capacity_frames;
+            return;
+        }
+        uint32_t first = capacity_frames - write_pos;
+        if (first > count) first = count;
+        ConvertFloatToInt16(
+            ring.data() + static_cast<size_t>(write_pos) * kChannels,
+            stereo,
+            static_cast<size_t>(first) * kChannels);
+        if (first < count) {
+            uint32_t rem = count - first;
+            ConvertFloatToInt16(
+                ring.data(),
+                stereo + static_cast<size_t>(first) * kChannels,
+                static_cast<size_t>(rem) * kChannels);
+        }
+        write_pos = (write_pos + count) % capacity_frames;
+        filled = (filled + count > capacity_frames) ? capacity_frames : (filled + count);
+    }
+
+    void WriteFramesInt16Locked(const int16_t* stereo, uint32_t count) {
+        if (count == 0 || capacity_frames == 0) return;
+        if (count >= capacity_frames) {
+            const int16_t* tail = stereo + static_cast<size_t>(count - capacity_frames) * kChannels;
+            std::memcpy(ring.data(), tail, static_cast<size_t>(capacity_frames) * kChannels * sizeof(int16_t));
             write_pos = 0;
             filled = capacity_frames;
             return;
@@ -297,13 +336,13 @@ struct ProcLoopSession {
         std::memcpy(
             ring.data() + static_cast<size_t>(write_pos) * kChannels,
             stereo,
-            static_cast<size_t>(first) * kChannels * sizeof(float));
+            static_cast<size_t>(first) * kChannels * sizeof(int16_t));
         if (first < count) {
             uint32_t rem = count - first;
             std::memcpy(
                 ring.data(),
                 stereo + static_cast<size_t>(first) * kChannels,
-                static_cast<size_t>(rem) * kChannels * sizeof(float));
+                static_cast<size_t>(rem) * kChannels * sizeof(int16_t));
         }
         write_pos = (write_pos + count) % capacity_frames;
         filled = (filled + count > capacity_frames) ? capacity_frames : (filled + count);
@@ -312,7 +351,7 @@ struct ProcLoopSession {
     void WriteSilenceLocked(uint32_t count) {
         if (count == 0 || capacity_frames == 0) return;
         if (count >= capacity_frames) {
-            std::memset(ring.data(), 0, static_cast<size_t>(capacity_frames) * kChannels * sizeof(float));
+            std::memset(ring.data(), 0, static_cast<size_t>(capacity_frames) * kChannels * sizeof(int16_t));
             write_pos = 0;
             filled = capacity_frames;
             return;
@@ -322,10 +361,10 @@ struct ProcLoopSession {
         std::memset(
             ring.data() + static_cast<size_t>(write_pos) * kChannels,
             0,
-            static_cast<size_t>(first) * kChannels * sizeof(float));
+            static_cast<size_t>(first) * kChannels * sizeof(int16_t));
         if (first < count) {
             uint32_t rem = count - first;
-            std::memset(ring.data(), 0, static_cast<size_t>(rem) * kChannels * sizeof(float));
+            std::memset(ring.data(), 0, static_cast<size_t>(rem) * kChannels * sizeof(int16_t));
         }
         write_pos = (write_pos + count) % capacity_frames;
         filled = (filled + count > capacity_frames) ? capacity_frames : (filled + count);
@@ -460,7 +499,6 @@ static DWORD WINAPI CaptureThreadProc(LPVOID param) {
     SetEvent(sess->init_done_event);
 
     if (SUCCEEDED(hr) && client && capture) {
-        std::vector<float> conv_buf;
         HANDLE events[2] = {sess->stop_event, sess->ready_event};
 
         while (true) {
@@ -494,35 +532,34 @@ static DWORD WINAPI CaptureThreadProc(LPVOID param) {
                 bool has_signal = false;
 
                 if (!is_silent && num_frames > 0) {
-                    const float* fptr = nullptr;
+                    size_t total_samples = static_cast<size_t>(num_frames) * kChannels;
                     if (is_float) {
-                        fptr = reinterpret_cast<const float*>(data);
+                        const float* fptr = reinterpret_cast<const float*>(data);
+                        for (size_t i = 0; i < total_samples; i += 4) {
+                            if (std::fabs(fptr[i]) > 0.0002f) {
+                                has_signal = true;
+                                break;
+                            }
+                        }
+                        std::lock_guard<std::mutex> lk(sess->buf_mtx);
+                        // Pad any large prior silence gap before appending live audio
+                        sess->PadGapToQpcLocked(now_qpc, 80);
+                        sess->WriteFramesFloatLocked(fptr, num_frames);
+                        sess->last_write_qpc = now_qpc;
                     } else {
                         const int16_t* sptr = reinterpret_cast<const int16_t*>(data);
-                        size_t total_samples = static_cast<size_t>(num_frames) * kChannels;
-                        if (conv_buf.size() < total_samples) {
-                            conv_buf.resize(total_samples);
+                        for (size_t i = 0; i < total_samples; i += 4) {
+                            int v = static_cast<int>(sptr[i]);
+                            if (v > 6 || v < -6) {
+                                has_signal = true;
+                                break;
+                            }
                         }
-                        constexpr float kInv32768 = 1.0f / 32768.0f;
-                        for (size_t i = 0; i < total_samples; ++i) {
-                            conv_buf[i] = static_cast<float>(sptr[i]) * kInv32768;
-                        }
-                        fptr = conv_buf.data();
+                        std::lock_guard<std::mutex> lk(sess->buf_mtx);
+                        sess->PadGapToQpcLocked(now_qpc, 80);
+                        sess->WriteFramesInt16Locked(sptr, num_frames);
+                        sess->last_write_qpc = now_qpc;
                     }
-
-                    size_t total_samples = static_cast<size_t>(num_frames) * kChannels;
-                    for (size_t i = 0; i < total_samples; i += 4) {
-                        if (std::fabs(fptr[i]) > 0.0002f) {
-                            has_signal = true;
-                            break;
-                        }
-                    }
-
-                    std::lock_guard<std::mutex> lk(sess->buf_mtx);
-                    // Pad any large prior silence gap before appending live audio
-                    sess->PadGapToQpcLocked(now_qpc, 80);
-                    sess->WriteFramesLocked(fptr, num_frames);
-                    sess->last_write_qpc = now_qpc;
                 } else if (num_frames > 0) {
                     std::lock_guard<std::mutex> lk(sess->buf_mtx);
                     sess->PadGapToQpcLocked(now_qpc, 80);
@@ -602,7 +639,7 @@ __declspec(dllexport) void* procloop_create(uint32_t target_pid, double duration
     sess->pid = static_cast<DWORD>(target_pid);
     uint32_t cap = ClampCapacityFrames(duration_s);
     sess->capacity_frames = cap;
-    sess->ring.assign(static_cast<size_t>(cap) * kChannels, 0.0f);
+    sess->ring.assign(static_cast<size_t>(cap) * kChannels, 0);
 
     sess->stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     sess->ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -676,16 +713,20 @@ __declspec(dllexport) uint32_t procloop_snapshot(
 
     uint32_t first = cap - start;
     if (first > take) first = take;
-    std::memcpy(
-        out_buf,
-        sess->ring.data() + static_cast<size_t>(start) * kChannels,
-        static_cast<size_t>(first) * kChannels * sizeof(float));
+    constexpr float kInv32768 = 1.0f / 32768.0f;
+    const int16_t* src1 = sess->ring.data() + static_cast<size_t>(start) * kChannels;
+    size_t first_samples = static_cast<size_t>(first) * kChannels;
+    for (size_t i = 0; i < first_samples; ++i) {
+        out_buf[i] = static_cast<float>(src1[i]) * kInv32768;
+    }
     if (first < take) {
         uint32_t rem = take - first;
-        std::memcpy(
-            out_buf + static_cast<size_t>(first) * kChannels,
-            sess->ring.data(),
-            static_cast<size_t>(rem) * kChannels * sizeof(float));
+        const int16_t* src2 = sess->ring.data();
+        float* dst2 = out_buf + first_samples;
+        size_t rem_samples = static_cast<size_t>(rem) * kChannels;
+        for (size_t i = 0; i < rem_samples; ++i) {
+            dst2[i] = static_cast<float>(src2[i]) * kInv32768;
+        }
     }
     return take;
 }
@@ -729,7 +770,7 @@ __declspec(dllexport) int procloop_resize(void* handle, double duration_s) {
         return 1;
     }
     uint32_t keep = (sess->filled > new_cap) ? new_cap : sess->filled;
-    std::vector<float> new_ring(static_cast<size_t>(new_cap) * kChannels, 0.0f);
+    std::vector<int16_t> new_ring(static_cast<size_t>(new_cap) * kChannels, 0);
     if (keep > 0 && sess->capacity_frames > 0) {
         uint32_t old_cap = sess->capacity_frames;
         uint32_t start = (sess->write_pos + old_cap - keep) % old_cap;
@@ -738,13 +779,13 @@ __declspec(dllexport) int procloop_resize(void* handle, double duration_s) {
         std::memcpy(
             new_ring.data(),
             sess->ring.data() + static_cast<size_t>(start) * kChannels,
-            static_cast<size_t>(first) * kChannels * sizeof(float));
+            static_cast<size_t>(first) * kChannels * sizeof(int16_t));
         if (first < keep) {
             uint32_t rem = keep - first;
             std::memcpy(
                 new_ring.data() + static_cast<size_t>(first) * kChannels,
                 sess->ring.data(),
-                static_cast<size_t>(rem) * kChannels * sizeof(float));
+                static_cast<size_t>(rem) * kChannels * sizeof(int16_t));
         }
     }
     sess->ring.swap(new_ring);

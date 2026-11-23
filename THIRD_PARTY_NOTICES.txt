@@ -1,0 +1,50 @@
+ClipMic — Third-Party Software Notices & Licenses
+=================================================
+
+ClipMic is licensed under the GNU General Public License v3.0 (GPL-3.0).
+See LICENSE for the full license text.
+
+This distribution incorporates or depends on the following third-party components:
+
+1. Onion Board (Direct Mic APO Heritage)
+   - Component: native/directmic/clipmic_apo.cpp (derived from Onion Board's native/directmic/obmic.cpp)
+   - License: GNU General Public License v3.0 (GPL-3.0)
+   - Notes: ClipMic's Windows Audio Processing Object (APO) retains GPL-3.0 licensing.
+
+2. FFmpeg (Gyan FFmpeg Essentials Build)
+   - Component: ffmpeg.exe (optional bundled binary or user-installed via WinGet Gyan.FFmpeg)
+   - License: GNU General Public License v3.0 (GPL-3.0)
+   - Website: https://ffmpeg.org/  |  https://www.gyan.dev/ffmpeg/builds/
+   - Notes: Invoked as a standalone subprocess for audio trimming and voice-effect filtering.
+
+3. PySide6 (Qt for Python) & Qt 6
+   - Component: PySide6==6.12.0
+   - License: GNU Lesser General Public License v3.0 (LGPL-3.0)
+   - Website: https://www.qt.io/qt-for-python
+   - Notes: Dynamically linked Qt libraries; users may replace the LGPL-3.0 Qt shared libraries
+     with compatible versions in accordance with the LGPL-3.0.
+
+4. NumPy
+   - Component: numpy==2.4.6
+   - License: BSD 3-Clause License
+   - Website: https://numpy.org/
+
+5. PyAudioWPatch (and PortAudio)
+   - Component: PyAudioWPatch==0.2.12.9
+   - License: MIT License (PortAudio: MIT License)
+   - Website: https://github.com/s0d3s/PyAudioWPatch
+
+6. python-sounddevice (and PortAudio)
+   - Component: sounddevice==0.5.2
+   - License: MIT License (PortAudio: MIT License)
+   - Website: https://python-sounddevice.readthedocs.io/
+
+7. comtypes
+   - Component: comtypes==1.4.16
+   - License: MIT License
+   - Website: https://github.com/enthought/comtypes
+
+8. psutil
+   - Component: psutil==5.9.8
+   - License: BSD 3-Clause License
+   - Website: https://github.com/giampaolo/psutil

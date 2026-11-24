@@ -164,6 +164,12 @@ QPushButton#Danger:hover {
     border-color: #5C3A41;
     color: #E2A8AE;
 }
+QPushButton#StopIdle, QPushButton#StopIdle:disabled {
+    background-color: #111114;
+    border: 1px dashed #25252D;
+    color: #55555F;
+    font-weight: 500;
+}
 QPushButton#ExportCard {
     background-color: #141417;
     color: #C8C8D0;
@@ -2976,6 +2982,8 @@ class MainWindow(QMainWindow):
 
         stop_hk = str(self._config.get("stop_hotkey", "F10") or "")
         self._stop_btn = QPushButton()
+        self._stop_btn.setObjectName("StopIdle")
+        self._stop_btn.setEnabled(False)
         self._stop_btn.setMinimumHeight(38)
         self._stop_btn.clicked.connect(self.stop_all_audio)
 
@@ -3653,7 +3661,9 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 self._clip_row_buttons.pop(cid, None)
 
-        self._stop_btn.setObjectName("Danger" if active_id is not None else "")
+        is_active = active_id is not None
+        self._stop_btn.setEnabled(is_active)
+        self._stop_btn.setObjectName("Danger" if is_active else "StopIdle")
         self._repolish_widget(self._stop_btn)
 
     def _stop_other_dialog_playback(self) -> None:

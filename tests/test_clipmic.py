@@ -19,8 +19,10 @@ import audio_buffer
 import effects
 import hotkeys
 import i18n
+import main as clipmic_main
 import mic_inject
 import paths
+import updater
 
 
 class TestPreviewEndLatency(unittest.TestCase):
@@ -499,6 +501,383 @@ class TestFastClipCore(unittest.TestCase):
             self.assertEqual(reloaded["fast_clip_hotkey"], "Ctrl+F7")
             self.assertEqual(reloaded["fast_clip_seconds"], hotkeys.MAX_FAST_CLIP_SECONDS)
             self.assertEqual(reloaded["fast_clip_effect"], "radio")
+
+
+class _FakeHTTPResponse:
+    """Minimal context-managed fake urllib response for offline updater tests."""
+
+    def __init__(self, body: bytes, url: str, headers: dict[str, str] | None = None) -> None:
+        self._body = body
+        self._pos = 0
+        self._url = url
+        self.headers = headers or {"Content-Length": str(len(body))}
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            out = self._body[self._pos :]
+            self._pos = len(self._body)
+            return out
+        out = self._body[self._pos : self._pos + n]
+        self._pos += len(out)
+        return out
+
+    def geturl(self) -> str:
+        return self._url
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "_FakeHTTPResponse":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
+
+class TestUpdaterAndReleaseGuardrails(unittest.TestCase):
+    def test_semver_parsing_and_numeric_comparison(self) -> None:
+        self.assertEqual(updater.parse_semver("1.0.0"), (1, 0, 0))
+        self.assertEqual(updater.parse_semver("v1.10.2"), (1, 10, 2))
+        self.assertEqual(updater.parse_semver("V2.0.15"), (2, 0, 15))
+        for bad in ("", "1.0", "1.0.0.0", "1.0.0-beta", "vv1.0.0", "1.a.0", "1.0.0\n", "١.٢.٣"):
+            with self.assertRaises(ValueError, msg=f"Should reject {bad!r}"):
+                updater.parse_semver(bad)
+
+        self.assertTrue(updater.is_newer_version("1.10.0", "1.9.0"))
+        self.assertTrue(updater.is_newer_version("v1.2.0", "1.1.9"))
+        self.assertFalse(updater.is_newer_version("1.2.0", "1.2.0"))
+        self.assertFalse(updater.is_newer_version("v1.2.0", "1.2.0"))
+        self.assertFalse(updater.is_newer_version("1.1.9", "1.2.0"))
+        self.assertFalse(updater.is_newer_version("not-a-ver", "1.0.0"))
+
+    def test_trusted_download_url_allowlist(self) -> None:
+        good_urls = [
+            "https://github.com/3bdyna/clipmic/releases/download/v1.1.0/ClipMic-Setup-1.1.0.exe",
+            "https://api.github.com/repos/3bdyna/clipmic/releases/latest",
+            "https://objects.githubusercontent.com/github-production-release-asset/123",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/456",
+            "https://codeload.github.com/3bdyna/clipmic/zip/refs/tags/v1.1.0",
+        ]
+        for url in good_urls:
+            self.assertTrue(updater.is_trusted_download_url(url), f"Expected trusted: {url}")
+
+        bad_urls = [
+            "",
+            "http://github.com/3bdyna/clipmic/releases/download/v1.1.0/ClipMic-Setup-1.1.0.exe",
+            "file:///C:/Windows/System32/cmd.exe",
+            "https://evil.com/ClipMic-Setup-1.1.0.exe",
+            "https://github.com.evil.com/3bdyna/clipmic/releases/latest",
+            "https://sub.github.com/3bdyna/clipmic/releases/latest",
+            "https://github.com@evil.com/ClipMic-Setup-1.1.0.exe",
+            "https://user:pass@github.com/3bdyna/clipmic",
+            "https://github.com:8443/3bdyna/clipmic",
+            "https://github.com:/3bdyna/clipmic",
+            "https://github.com/3bdyna\\clipmic",
+            "https://github.com/path\x7f",
+            "https://github.com./3bdyna/clipmic",
+            "https://github.com/path\r\nX-Injected: 1",
+        ]
+        for url in bad_urls:
+            self.assertFalse(updater.is_trusted_download_url(url), f"Expected rejected: {url}")
+
+        self.assertTrue(
+            updater.is_trusted_release_page_url("https://github.com/3bdyna/clipmic/releases/tag/v1.1.0")
+        )
+        self.assertFalse(
+            updater.is_trusted_release_page_url("https://objects.githubusercontent.com/3bdyna/clipmic")
+        )
+        self.assertFalse(
+            updater.is_trusted_release_page_url("https://github.com/other/repo/releases/tag/v1.1.0")
+        )
+
+    def test_redirect_handler_blocks_untrusted_hops(self) -> None:
+        import urllib.request
+
+        handler = updater._SafeGitHubRedirectHandler()
+        req = urllib.request.Request("https://github.com/3bdyna/clipmic/releases/download/v1.1.0/a.exe")
+        with self.assertRaises(updater.UntrustedUrlError):
+            handler.redirect_request(req, None, 302, "Found", {}, "https://evil.example/payload.exe")
+        with self.assertRaises(updater.UntrustedUrlError):
+            handler.redirect_request(req, None, 302, "Found", {}, "//evil.example/payload.exe")
+        with self.assertRaises(updater.UntrustedUrlError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://objects.githubusercontent.com/a.exe")
+        allowed = handler.redirect_request(
+            req, None, 302, "Found", {}, "https://release-assets.githubusercontent.com/a.exe"
+        )
+        self.assertIsNotNone(allowed)
+        self.assertEqual(allowed.full_url, "https://release-assets.githubusercontent.com/a.exe")
+
+    def test_parse_sha256sums_and_verify_file_sha256(self) -> None:
+        import hashlib
+
+        payload = b"clipmic-installer-test-payload-bytes"
+        expected = hashlib.sha256(payload).hexdigest()
+        sums_two_spaces = f"\ufeff# comment\n{expected.upper()}  ClipMic-Setup-1.1.0.exe\n"
+        sums_star = f"{expected} *ClipMic-Setup-1.1.0.exe\n"
+        sums_wrong_path = f"{expected}  dist/ClipMic-Setup-1.1.0.exe\n"
+        sums_bad_hex = f"{'z' * 64}  ClipMic-Setup-1.1.0.exe\n"
+
+        self.assertEqual(updater.parse_sha256sums(sums_two_spaces, "ClipMic-Setup-1.1.0.exe"), expected)
+        self.assertEqual(updater.parse_sha256sums(sums_star, "ClipMic-Setup-1.1.0.exe"), expected)
+        self.assertIsNone(updater.parse_sha256sums(sums_two_spaces, "Other.exe"))
+        self.assertIsNone(updater.parse_sha256sums(sums_wrong_path, "ClipMic-Setup-1.1.0.exe"))
+        self.assertIsNone(updater.parse_sha256sums(sums_bad_hex, "ClipMic-Setup-1.1.0.exe"))
+        self.assertIsNone(updater.parse_sha256sums(sums_two_spaces, "../ClipMic-Setup-1.1.0.exe"))
+
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "ClipMic-Setup-1.1.0.exe"
+            f.write_bytes(payload)
+            self.assertTrue(updater.verify_file_sha256(f, expected))
+            self.assertTrue(updater.verify_file_sha256(f, expected.upper()))
+            self.assertFalse(updater.verify_file_sha256(f, "0" * 64))
+            self.assertFalse(updater.verify_file_sha256(f, "short"))
+
+    def test_check_for_updates_mocked_scenarios(self) -> None:
+        import json
+        import ssl
+        import urllib.error
+        from unittest import mock
+
+        base_release = {
+            "tag_name": "v1.2.0",
+            "draft": False,
+            "prerelease": False,
+            "body": "Bug fixes and improvements.",
+            "html_url": "https://github.com/3bdyna/clipmic/releases/tag/v1.2.0",
+            "published_at": "2026-11-24T00:00:00Z",
+            "assets": [
+                {
+                    "name": "ClipMic-Setup-1.2.0.exe.sig",
+                    "size": 64,
+                    "browser_download_url": "https://github.com/3bdyna/clipmic/releases/download/v1.2.0/ClipMic-Setup-1.2.0.exe.sig",
+                },
+                {
+                    "name": "ClipMic-Setup-1.2.0.exe",
+                    "size": 123456,
+                    "browser_download_url": "https://github.com/3bdyna/clipmic/releases/download/v1.2.0/ClipMic-Setup-1.2.0.exe",
+                },
+                {
+                    "name": "SHA256SUMS.txt",
+                    "size": 95,
+                    "browser_download_url": "https://github.com/3bdyna/clipmic/releases/download/v1.2.0/SHA256SUMS.txt",
+                },
+            ],
+        }
+
+        def _fake_open_json(payload: dict):
+            raw = json.dumps(payload).encode("utf-8")
+            return lambda url, **kw: _FakeHTTPResponse(raw, url)
+
+        # 1. Newer release with valid installer + SHA256SUMS.txt
+        with mock.patch.object(updater, "_open_trusted_url", side_effect=_fake_open_json(base_release)):
+            res = updater.check_for_updates(current_version="1.0.0")
+            self.assertEqual(res.status, "update_available")
+            self.assertIsNotNone(res.release)
+            assert res.release is not None
+            self.assertEqual(res.release.version, "1.2.0")
+            self.assertEqual(res.release.installer_name, "ClipMic-Setup-1.2.0.exe")
+
+        # 2. Already up to date
+        with mock.patch.object(updater, "_open_trusted_url", side_effect=_fake_open_json(base_release)):
+            res = updater.check_for_updates(current_version="1.2.0")
+            self.assertEqual(res.status, "up_to_date")
+            self.assertIsNone(res.release)
+
+        # 3. Draft / prerelease ignored
+        for flag in ("draft", "prerelease"):
+            flagged = dict(base_release, **{flag: True})
+            with mock.patch.object(updater, "_open_trusted_url", side_effect=_fake_open_json(flagged)):
+                res = updater.check_for_updates(current_version="1.0.0")
+                self.assertEqual(res.status, "up_to_date")
+
+        # 4. Missing SHA256SUMS.txt rejected
+        no_sums = dict(base_release, assets=[base_release["assets"][1]])
+        with mock.patch.object(updater, "_open_trusted_url", side_effect=_fake_open_json(no_sums)):
+            res = updater.check_for_updates(current_version="1.0.0")
+            self.assertEqual(res.status, "error")
+            self.assertEqual(res.error_code, "missing_assets")
+
+        # 5. 404, 403 rate limit, network error, TLS error handled cleanly without raising
+        err_404 = urllib.error.HTTPError("https://api.github.com/x", 404, "Not Found", {}, None)
+        with mock.patch.object(updater, "_open_trusted_url", side_effect=err_404):
+            res = updater.check_for_updates(current_version="1.0.0")
+            self.assertEqual(res.status, "error")
+            self.assertEqual(res.error_code, "no_releases")
+
+        err_403 = urllib.error.HTTPError(
+            "https://api.github.com/x", 403, "rate limit exceeded", {"X-RateLimit-Remaining": "0"}, None
+        )
+        with mock.patch.object(updater, "_open_trusted_url", side_effect=err_403):
+            res = updater.check_for_updates(current_version="1.0.0")
+            self.assertEqual(res.status, "error")
+            self.assertEqual(res.error_code, "rate_limited")
+
+        with mock.patch.object(updater, "_open_trusted_url", side_effect=urllib.error.URLError("offline")):
+            res = updater.check_for_updates(current_version="1.0.0")
+            self.assertEqual(res.status, "error")
+            self.assertEqual(res.error_code, "network")
+
+        with mock.patch.object(
+            updater, "_open_trusted_url", side_effect=urllib.error.URLError(ssl.SSLError("cert failed"))
+        ):
+            res = updater.check_for_updates(current_version="1.0.0")
+            self.assertEqual(res.status, "error")
+            self.assertEqual(res.error_code, "tls")
+
+        import http.client
+
+        with mock.patch.object(
+            updater, "_open_trusted_url", side_effect=http.client.IncompleteRead(b"partial")
+        ):
+            res = updater.check_for_updates(current_version="1.0.0")
+            self.assertEqual(res.status, "error")
+            self.assertEqual(res.error_code, "network")
+
+    def test_download_and_verify_update_success_tamper_and_cancel(self) -> None:
+        import hashlib
+        from unittest import mock
+
+        installer_bytes = b"MZ" + (b"ClipMicTestData" * 12000)
+        good_sha = hashlib.sha256(installer_bytes).hexdigest()
+        sums_bytes = f"{good_sha}  ClipMic-Setup-1.2.0.exe\n".encode("utf-8")
+
+        release = updater.ReleaseInfo(
+            version="1.2.0",
+            tag_name="v1.2.0",
+            notes="Release notes",
+            html_url="https://github.com/3bdyna/clipmic/releases/tag/v1.2.0",
+            installer_name="ClipMic-Setup-1.2.0.exe",
+            installer_url="https://github.com/3bdyna/clipmic/releases/download/v1.2.0/ClipMic-Setup-1.2.0.exe",
+            installer_size=len(installer_bytes),
+            checksums_url="https://github.com/3bdyna/clipmic/releases/download/v1.2.0/SHA256SUMS.txt",
+            published_at="2026-11-24T00:00:00Z",
+        )
+
+        # 1. Valid download succeeds and leaves no .part file behind
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td)
+            seen_progress: list[tuple[int, int]] = []
+
+            def _ok_open(url: str, **kw):
+                if url.endswith("SHA256SUMS.txt"):
+                    return _FakeHTTPResponse(sums_bytes, url)
+                return _FakeHTTPResponse(installer_bytes, url)
+
+            with mock.patch.object(updater, "_open_trusted_url", side_effect=_ok_open):
+                out = updater.download_and_verify_update(
+                    release, dest, on_progress=lambda d, tot: seen_progress.append((d, tot))
+                )
+            self.assertEqual(out, (dest / "ClipMic-Setup-1.2.0.exe").resolve())
+            self.assertTrue(out.is_file())
+            self.assertEqual(out.read_bytes(), installer_bytes)
+            self.assertFalse((dest / "ClipMic-Setup-1.2.0.exe.part").exists())
+            self.assertTrue(seen_progress and seen_progress[-1][0] == len(installer_bytes))
+
+        # 2. Tampered bytes fail SHA-256 and delete partial/corrupt file
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td)
+            tampered = installer_bytes[:-4] + b"EVIL"
+
+            def _tampered_open(url: str, **kw):
+                if url.endswith("SHA256SUMS.txt"):
+                    return _FakeHTTPResponse(sums_bytes, url)
+                return _FakeHTTPResponse(tampered, url)
+
+            with mock.patch.object(updater, "_open_trusted_url", side_effect=_tampered_open):
+                with self.assertRaises(updater.UpdateError):
+                    updater.download_and_verify_update(release, dest)
+            self.assertFalse((dest / "ClipMic-Setup-1.2.0.exe").exists())
+            self.assertFalse((dest / "ClipMic-Setup-1.2.0.exe.part").exists())
+
+        # 3. Cancellation cleans up .part file
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td)
+            cancel_ev = threading.Event()
+
+            def _cancel_on_first_chunk(downloaded: int, _total: int) -> None:
+                if downloaded > 0:
+                    cancel_ev.set()
+
+            with mock.patch.object(updater, "_open_trusted_url", side_effect=_ok_open):
+                with self.assertRaises(updater.UpdateCancelledError):
+                    updater.download_and_verify_update(
+                        release, dest, on_progress=_cancel_on_first_chunk, cancel_event=cancel_ev
+                    )
+            self.assertFalse((dest / "ClipMic-Setup-1.2.0.exe").exists())
+            self.assertFalse((dest / "ClipMic-Setup-1.2.0.exe.part").exists())
+
+    def test_release_and_installer_static_guardrails(self) -> None:
+        # 1. Single source of truth strict semver in paths.py
+        self.assertRegex(paths.APP_VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertRegex(paths.GITHUB_REPO, r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+        # 2. Inno Setup installer invariants
+        iss_path = ROOT / "installer" / "ClipMic.iss"
+        self.assertTrue(iss_path.is_file(), "installer/ClipMic.iss must exist")
+        iss_text = iss_path.read_text(encoding="utf-8")
+        self.assertRegex(
+            iss_text,
+            r"(?m)^AppId=\{\{[0-9A-Fa-f-]{36}\}$",
+            "installer/ClipMic.iss must pin a fixed static AppId GUID",
+        )
+        self.assertIn("PrivilegesRequired=lowest", iss_text)
+        self.assertIn(f"AppMutex={clipmic_main._MUTEX_NAME}", iss_text)
+        self.assertIn(f"CheckForMutexes('{clipmic_main._MUTEX_NAME}')", iss_text)
+        self.assertIn("AppVersion={#MyAppVersion}", iss_text)
+        self.assertNotRegex(
+            iss_text,
+            r"(?m)^AppVersion=\d+\.\d+\.\d+",
+            "installer/ClipMic.iss must derive AppVersion from {#MyAppVersion}, never hardcode it",
+        )
+        self.assertNotIn("[UninstallDelete]", iss_text)
+        self.assertNotIn("{localappdata}\\ClipMic", iss_text.lower())
+        self.assertIn("/RELAUNCH", iss_text)
+        self.assertIn("/RELAUNCH", updater.build_installer_command(Path("ClipMic-Setup-1.0.0.exe"), silent=True))
+
+        # 3. ClipMic.spec must not exclude TLS/SSL or urllib needed by updater.py
+        spec_text = (ROOT / "ClipMic.spec").read_text(encoding="utf-8")
+        for forbidden_exclude in ("'ssl'", '"ssl"', "'_ssl'", '"_ssl"', "'urllib'", '"urllib"'):
+            self.assertNotIn(
+                forbidden_exclude,
+                spec_text,
+                f"ClipMic.spec must not exclude {forbidden_exclude}",
+            )
+
+        # 4. Release script exists
+        self.assertTrue((ROOT / "scripts" / "build_release.ps1").is_file())
+
+    def test_update_dialog_reject_cancels_active_download(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        import ui
+
+        _app = QApplication.instance() or QApplication([])
+        rel = updater.ReleaseInfo(
+            version="1.2.0",
+            tag_name="v1.2.0",
+            notes="Notes",
+            html_url="https://github.com/3bdyna/clipmic/releases/tag/v1.2.0",
+            installer_name="ClipMic-Setup-1.2.0.exe",
+            installer_url="https://github.com/3bdyna/clipmic/releases/download/v1.2.0/ClipMic-Setup-1.2.0.exe",
+            installer_size=1024,
+            checksums_url="https://github.com/3bdyna/clipmic/releases/download/v1.2.0/SHA256SUMS.txt",
+            published_at="2026-11-24T00:00:00Z",
+        )
+        dlg = ui.UpdateDialog(rel, is_frozen_build=True)
+        try:
+            cancelled = []
+
+            class _FakeWorker:
+                def cancel(self) -> None:
+                    cancelled.append(True)
+
+            dlg._downloading = True
+            dlg._dl_worker = _FakeWorker()  # type: ignore[assignment]
+            dlg.reject()
+            self.assertTrue(cancelled, "reject()/Escape must cancel an active download")
+            self.assertFalse(dlg._downloading)
+            self.assertIsNone(dlg.verified_installer_path)
+        finally:
+            dlg.deleteLater()
 
 
 if __name__ == "__main__":

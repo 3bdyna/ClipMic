@@ -65,12 +65,29 @@ def _show_window_msg_id() -> int:
 
 def _acquire_single_instance_mutex(name: str = _MUTEX_NAME):
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
     handle = kernel32.CreateMutexW(None, False, name)
     if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
         if handle:
-            kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(ctypes.c_void_p(int(handle)))
         return None
     return handle
+
+
+def _release_single_instance_mutex(handle) -> None:
+    """Explicitly close the single-instance mutex handle so silent updates never race."""
+    if not handle:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32.CloseHandle(ctypes.c_void_p(int(handle)))
+    except Exception:
+        pass
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -80,14 +97,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         return apo_rc
 
     logger = paths.setup_logging()
-    paths.migrate_legacy_data()
-    paths.cleanup_temp_files()
 
     from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Qt, Signal
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
     import i18n
+    import updater
     from audio_buffer import MultiChannelCapture
     from hotkeys import (
         ClipEntry,
@@ -172,7 +188,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             QMessageBox.information(None, t("app.title"), t("app.already_running"))
         return 0
 
-    logger.info("ClipMic starting (frozen=%s, data=%s)", paths.is_frozen(), paths.user_data_dir())
+    paths.migrate_legacy_data()
+    paths.cleanup_temp_files(clean_old_installers=True)
+    logger.info(
+        "ClipMic v%s starting (frozen=%s, data=%s)",
+        paths.APP_VERSION,
+        paths.is_frozen(),
+        paths.user_data_dir(),
+    )
+    mutex_holder: dict[str, object] = {"handle": mutex}
+
+    def release_mutex() -> None:
+        h = mutex_holder["handle"]
+        if h:
+            mutex_holder["handle"] = None
+            _release_single_instance_mutex(h)
     clips = load_clips()
     buf_s = clamp_buffer_seconds(config.get("buffer_seconds", 30))
     fast_s = clamp_fast_clip_seconds(config.get("fast_clip_seconds", DEFAULT_FAST_CLIP_SECONDS))
@@ -218,7 +248,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
         return hotkeys.set_bindings(bindings)
 
-    win = MainWindow(ring, injector, config, clips, apply_hotkeys)
+    update_exit_ref: list = []
+
+    def _on_update_exit(installer_path: Path) -> None:
+        if update_exit_ref:
+            update_exit_ref[0](installer_path)
+
+    win = MainWindow(ring, injector, config, clips, apply_hotkeys, on_update_exit=_on_update_exit)
     ring.set_status_callback(lambda state, detail: win.loopback_status_changed.emit(state, detail))
     window_ref.append(win)
     apply_hotkeys(config, clips)
@@ -291,7 +327,29 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     def quit_app() -> None:
         cleanup_all()
+        release_mutex()
         app.quit()
+
+    def request_update_exit(installer_path: Path) -> None:
+        exe_path = Path(installer_path)
+        if not exe_path.is_file():
+            raise FileNotFoundError(f"Verified update installer not found: {exe_path}")
+        logger.info("Handing off to verified installer: %s", exe_path)
+        cleanup_all()
+        release_mutex()
+        try:
+            updater.launch_installer(exe_path, silent=True)
+        except Exception as exc:
+            logger.error("Failed to launch verified installer: %s", exc)
+            QMessageBox.warning(
+                None,
+                t("update.download_failed_title"),
+                t("update.download_failed_body", err=str(exc)),
+            )
+        finally:
+            app.quit()
+
+    update_exit_ref.append(request_update_exit)
 
     act_quit.triggered.connect(quit_app)
     menu.addAction(act_show)
@@ -324,6 +382,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     rc = app.exec()
     cleanup_all()
+    release_mutex()
     logger.info("ClipMic exited cleanly (rc=%d)", rc)
     return rc
 

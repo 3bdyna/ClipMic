@@ -17,6 +17,8 @@ except ImportError:  # pragma: no cover
     winreg = None  # type: ignore[assignment]
 
 APP_NAME = "ClipMic"
+APP_VERSION = "1.0.0"
+GITHUB_REPO = "3bdyna/clipmic"
 STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "ClipMic"
 
@@ -105,6 +107,13 @@ def temp_dir() -> Path:
     return d
 
 
+def updates_dir() -> Path:
+    """Per-user staging directory for verified update installers (%LOCALAPPDATA%\\ClipMic\\updates)."""
+    d = user_data_dir() / "updates"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def migrate_legacy_data(legacy_root: Optional[Path] = None) -> bool:
     """One-time safe migration from legacy repo/app-dir files into %LOCALAPPDATA%\\ClipMic.
 
@@ -154,8 +163,8 @@ def migrate_legacy_data(legacy_root: Optional[Path] = None) -> bool:
     return copied_any
 
 
-def cleanup_temp_files() -> int:
-    """Remove orphaned temporary preview/capture WAV files safely."""
+def cleanup_temp_files(*, clean_old_installers: bool = False) -> int:
+    """Remove orphaned temporary preview/capture WAV files and partial downloads safely."""
     removed = 0
     dirs = [
         temp_dir(),
@@ -171,6 +180,16 @@ def cleanup_temp_files() -> int:
                 removed += 1
             except OSError:
                 pass
+    upd_dir = user_data_dir() / "updates"
+    if upd_dir.is_dir():
+        patterns = ["*.part", "ClipMic-Setup-*.exe"] if clean_old_installers else ["*.part"]
+        for pattern in patterns:
+            for item in upd_dir.glob(pattern):
+                try:
+                    item.unlink()
+                    removed += 1
+                except OSError:
+                    pass
     return removed
 
 

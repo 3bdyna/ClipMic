@@ -6,14 +6,15 @@ import gc
 import re
 import shutil
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-from PySide6.QtCore import QByteArray, QEvent, QObject, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache
+from PySide6.QtCore import QByteArray, QEvent, QObject, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,6 +30,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
     QProxyStyle,
     QPushButton,
     QScrollArea,
@@ -41,6 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 import paths
+import updater
 from audio_buffer import (
     CaptureSnapshot,
     ChannelClip,
@@ -560,6 +564,30 @@ QScrollBar::handle:vertical:hover {{
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
+}}
+QPlainTextEdit {{
+    background-color: #141618;
+    border: 1px solid #191b1e;
+    border-radius: 5px;
+    padding: 8px;
+    color: #d8dce3;
+    font-family: {_UI_FONT};
+    font-size: 12px;
+}}
+QProgressBar {{
+    background-color: #141618;
+    border: 1px solid #191b1e;
+    border-radius: 4px;
+    text-align: center;
+    color: #f2f3f5;
+    font-family: {_MONO_FONT};
+    font-size: 11px;
+    font-weight: 600;
+    min-height: 16px;
+}}
+QProgressBar::chunk {{
+    background-color: #ff6229;
+    border-radius: 3px;
 }}
 QToolTip {{
     background-color: #141618;
@@ -3370,6 +3398,391 @@ class _DeviceScanWorker(QObject):
         self.finished.emit(mics, loopbacks)
 
 
+_ORPHANED_THREADS: set[tuple[QThread, Optional[QObject]]] = set()
+
+
+def _detach_running_thread(
+    thread: Optional[QThread],
+    worker: Optional[QObject],
+    *,
+    wait_ms: int = 500,
+    signals: tuple = (),
+) -> None:
+    """Stop a QThread safely without ever destroying a running C++ QThread."""
+    for sig in signals:
+        try:
+            sig.disconnect()
+        except Exception:
+            pass
+    if thread is None:
+        return
+    if thread.isRunning():
+        thread.quit()
+        if not thread.wait(wait_ms):
+            entry = (thread, worker)
+            _ORPHANED_THREADS.add(entry)
+            thread.setParent(None)
+
+            def _reap(ent=entry) -> None:
+                _ORPHANED_THREADS.discard(ent)
+                if ent[1] is not None:
+                    ent[1].deleteLater()
+                ent[0].deleteLater()
+
+            thread.finished.connect(_reap)
+            return
+    if worker is not None:
+        worker.deleteLater()
+    thread.deleteLater()
+
+
+def _format_bytes_mb(num_bytes: int) -> str:
+    mb = max(0.0, float(num_bytes) / (1024.0 * 1024.0))
+    return f"{mb:.1f} MB"
+
+
+class _UpdateCheckWorker(QObject):
+    """Background worker that checks GitHub Releases without blocking the UI thread."""
+
+    finished = Signal(object)  # updater.UpdateCheckResult
+
+    def __init__(self, timeout: float = 10.0) -> None:
+        super().__init__()
+        self._timeout = float(timeout)
+
+    def run(self) -> None:
+        try:
+            result = updater.check_for_updates(timeout=self._timeout)
+        except Exception as exc:
+            result = updater.UpdateCheckResult(
+                status="error",
+                current_version=paths.APP_VERSION,
+                error=str(exc),
+                error_code="unknown",
+            )
+        self.finished.emit(result)
+
+
+class _UpdateDownloadWorker(QObject):
+    """Background worker that downloads and SHA-256 verifies a release installer."""
+
+    progress = Signal(int, int)  # downloaded_bytes, total_bytes
+    verifying = Signal()
+    finished = Signal(str, str, bool)  # installer_path_str, error_msg, cancelled
+
+    def __init__(self, release: updater.ReleaseInfo, dest_dir: Path) -> None:
+        super().__init__()
+        self._release = release
+        self._dest_dir = Path(dest_dir)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self) -> None:
+        last_emit = [0.0]
+
+        def _on_progress(downloaded: int, total: int) -> None:
+            now = time.monotonic()
+            if downloaded == 0 or (total > 0 and downloaded >= total) or (now - last_emit[0]) >= 0.06:
+                last_emit[0] = now
+                self.progress.emit(int(downloaded), int(total))
+
+        try:
+            exe_path = updater.download_and_verify_update(
+                self._release,
+                self._dest_dir,
+                on_progress=_on_progress,
+                cancel_event=self._cancel_event,
+                on_verifying=self.verifying.emit,
+            )
+            self.finished.emit(str(exe_path), "", False)
+        except updater.UpdateCancelledError:
+            self.finished.emit("", "", True)
+        except Exception as exc:
+            self.finished.emit("", str(exc), False)
+
+
+class UpdateDialog(QDialog):
+    """Dark-themed update review, download progress, and SHA-256 verification dialog."""
+
+    def __init__(
+        self,
+        release: updater.ReleaseInfo,
+        *,
+        is_frozen_build: bool,
+        confirm_before_download: Optional[Callable[[], bool]] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._release = release
+        self._is_frozen = bool(is_frozen_build)
+        self._confirm_before_download = confirm_before_download
+        self._dl_thread: Optional[QThread] = None
+        self._dl_worker: Optional[_UpdateDownloadWorker] = None
+        self._downloading: bool = False
+        self._closing: bool = False
+        self.verified_installer_path: Optional[Path] = None
+
+        self.setWindowTitle(t("update.window_title"))
+        self.setWindowIcon(make_app_icon())
+        self.setModal(True)
+        self.resize(500, 400)
+        self.setMinimumWidth(440)
+        self.setStyleSheet(DARK_QSS)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        hdr = QLabel(t("update.header_available"))
+        hdr.setAlignment(_text_align())
+        hdr.setStyleSheet("font-size: 16px; font-weight: 800; color: #f2f3f5;")
+        root.addWidget(hdr)
+
+        meta_card = QFrame()
+        meta_card.setObjectName("Card")
+        meta_lay = QVBoxLayout(meta_card)
+        meta_lay.setContentsMargins(12, 8, 12, 8)
+        meta_lay.setSpacing(4)
+
+        ver_lbl = QLabel(
+            t(
+                "update.version_change",
+                current=ltr(f"v{paths.APP_VERSION}"),
+                new=ltr(f"v{release.version}"),
+            )
+        )
+        ver_lbl.setAlignment(_text_align())
+        ver_lbl.setStyleSheet(f"color: #65d692; font-family: {_MONO_FONT}; font-size: 12px; font-weight: 700;")
+        meta_lay.addWidget(ver_lbl)
+
+        if release.installer_size > 0:
+            size_lbl = QLabel(t("update.file_size", size=ltr(_format_bytes_mb(release.installer_size))))
+            size_lbl.setAlignment(_text_align())
+            size_lbl.setStyleSheet(f"color: #b4b9c2; font-family: {_MONO_FONT}; font-size: 11px;")
+            meta_lay.addWidget(size_lbl)
+        root.addWidget(meta_card)
+
+        if not self._is_frozen:
+            dev_card = QFrame()
+            dev_card.setStyleSheet(
+                "QFrame { background-color: #2b2112; border: 1px solid #6b4c1a; border-radius: 6px; }"
+            )
+            dev_lay = QHBoxLayout(dev_card)
+            dev_lay.setContentsMargins(10, 8, 10, 8)
+            dev_lbl = QLabel(t("update.dev_mode_notice"))
+            dev_lbl.setWordWrap(True)
+            dev_lbl.setAlignment(_text_align())
+            dev_lbl.setStyleSheet("color: #fbbf24; font-size: 12px; background: transparent; border: none;")
+            dev_lay.addWidget(dev_lbl)
+            root.addWidget(dev_card)
+
+        notes_hdr = QLabel(t("update.notes_label"))
+        notes_hdr.setAlignment(_text_align())
+        notes_hdr.setStyleSheet("color: #b4b9c2; font-size: 12px; font-weight: 700;")
+        root.addWidget(notes_hdr)
+
+        self._notes_edit = QPlainTextEdit()
+        self._notes_edit.setReadOnly(True)
+        self._notes_edit.setPlainText(release.notes or t("update.notes_empty"))
+        self._notes_edit.setMinimumHeight(130)
+        root.addWidget(self._notes_edit, 1)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(False)
+        root.addWidget(self._progress_bar)
+
+        self._status_lbl = QLabel("")
+        self._status_lbl.setAlignment(_text_align())
+        self._status_lbl.setStyleSheet(f"color: #b4b9c2; font-family: {_MONO_FONT}; font-size: 11px;")
+        self._status_lbl.setVisible(False)
+        root.addWidget(self._status_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self._github_btn = QPushButton(t("update.btn_open_github"))
+        self._github_btn.clicked.connect(self._on_open_github)
+        btn_row.addWidget(self._github_btn)
+
+        btn_row.addStretch()
+
+        self._later_btn = QPushButton(t("update.btn_later"))
+        self._later_btn.clicked.connect(self._on_later_or_cancel)
+        btn_row.addWidget(self._later_btn)
+
+        self._update_btn = QPushButton(t("update.btn_update_now"))
+        self._update_btn.setObjectName("Primary")
+        self._update_btn.setIcon(_svg_icon("download", "#121212", 14))
+        self._update_btn.setIconSize(QSize(14, 14))
+        self._update_btn.clicked.connect(self._on_update_now)
+        self._update_btn.setEnabled(self._is_frozen)
+        btn_row.addWidget(self._update_btn)
+
+        root.addLayout(btn_row)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not getattr(self, "_dark_titlebar_applied", False):
+            self._dark_titlebar_applied = True
+            apply_dark_titlebar(self)
+
+    def _on_open_github(self) -> None:
+        url = self._release.html_url
+        if updater.is_trusted_release_page_url(url):
+            qurl = QUrl(url, QUrl.ParsingMode.StrictMode)
+            if qurl.isValid():
+                QDesktopServices.openUrl(qurl)
+
+    def _on_update_now(self) -> None:
+        if self._downloading or not self._is_frozen:
+            return
+        if self._confirm_before_download is not None and not self._confirm_before_download():
+            return
+        self._downloading = True
+        self._update_btn.setEnabled(False)
+        self._later_btn.setText(t("common.cancel"))
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(True)
+        self._status_lbl.setText(
+            t(
+                "update.status_downloading",
+                done=ltr("0.0 MB"),
+                total=ltr(_format_bytes_mb(self._release.installer_size)),
+            )
+            if self._release.installer_size > 0
+            else t("update.status_downloading_unknown", done=ltr("0.0 MB"))
+        )
+        self._status_lbl.setVisible(True)
+
+        thread = QThread(self)
+        worker = _UpdateDownloadWorker(self._release, paths.updates_dir())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_download_progress, Qt.ConnectionType.QueuedConnection)
+        worker.verifying.connect(self._on_download_verifying, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_download_finished, Qt.ConnectionType.QueuedConnection)
+        self._dl_thread = thread
+        self._dl_worker = worker
+        thread.start()
+
+    @Slot(int, int)
+    def _on_download_progress(self, downloaded: int, total: int) -> None:
+        if not self._downloading:
+            return
+        if total > 0:
+            pct = min(100, int((downloaded * 100) // total))
+            if self._progress_bar.maximum() == 0:
+                self._progress_bar.setRange(0, 100)
+            self._progress_bar.setValue(pct)
+            self._status_lbl.setText(
+                t(
+                    "update.status_downloading",
+                    done=ltr(_format_bytes_mb(downloaded)),
+                    total=ltr(_format_bytes_mb(total)),
+                )
+            )
+        else:
+            if self._progress_bar.maximum() != 0:
+                self._progress_bar.setRange(0, 0)
+            self._status_lbl.setText(
+                t("update.status_downloading_unknown", done=ltr(_format_bytes_mb(downloaded)))
+            )
+
+    @Slot()
+    def _on_download_verifying(self) -> None:
+        if not self._downloading:
+            return
+        self._status_lbl.setText(t("update.status_verifying"))
+
+    def _cleanup_download_thread(self, wait_ms: int = 1500) -> None:
+        thread = self._dl_thread
+        worker = self._dl_worker
+        self._dl_thread = None
+        self._dl_worker = None
+        sigs = (
+            tuple(
+                s
+                for s in (
+                    getattr(worker, "progress", None),
+                    getattr(worker, "verifying", None),
+                    getattr(worker, "finished", None),
+                )
+                if s is not None
+            )
+            if worker is not None
+            else ()
+        )
+        _detach_running_thread(thread, worker, wait_ms=wait_ms, signals=sigs)
+
+    @Slot(str, str, bool)
+    def _on_download_finished(self, installer_str: str, err: str, cancelled: bool) -> None:
+        self._cleanup_download_thread()
+        self._downloading = False
+        self._later_btn.setText(t("update.btn_later"))
+        self._later_btn.setEnabled(True)
+
+        if self._closing:
+            return
+
+        if cancelled:
+            self._progress_bar.setVisible(False)
+            self._status_lbl.setText(t("update.status_cancelled"))
+            self._update_btn.setEnabled(self._is_frozen)
+            return
+
+        if err or not installer_str:
+            self._progress_bar.setVisible(False)
+            self._status_lbl.setVisible(False)
+            self._update_btn.setEnabled(self._is_frozen)
+            QMessageBox.warning(
+                self,
+                t("update.download_failed_title"),
+                t("update.download_failed_body", err=err or "Unknown error"),
+            )
+            return
+
+        self.verified_installer_path = Path(installer_str)
+        self._status_lbl.setText(t("update.status_launching"))
+        self.accept()
+
+    def cancel_active_download(self) -> None:
+        self._closing = True
+        if self._dl_worker is not None:
+            self._dl_worker.cancel()
+        self._cleanup_download_thread(wait_ms=1000)
+        self._downloading = False
+
+    def _on_later_or_cancel(self) -> None:
+        if self._downloading and self._dl_worker is not None:
+            self._later_btn.setEnabled(False)
+            self._dl_worker.cancel()
+            return
+        self.reject()
+
+    def reject(self) -> None:
+        if self._downloading and self._dl_worker is not None:
+            self._closing = True
+            self._later_btn.setEnabled(False)
+            self._dl_worker.cancel()
+            self._cleanup_download_thread(wait_ms=1000)
+            self._downloading = False
+        super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self._downloading and self._dl_worker is not None:
+            self._closing = True
+            self._later_btn.setEnabled(False)
+            self._dl_worker.cancel()
+            self._cleanup_download_thread(wait_ms=1000)
+            self._downloading = False
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     """Minimal dark soundboard & capture controller."""
 
@@ -3394,6 +3807,7 @@ class MainWindow(QMainWindow):
         config: dict,
         clips: list[ClipEntry],
         on_save_state: Callable[[dict, list[ClipEntry]], list[str]],
+        on_update_exit: Optional[Callable[[Path], None]] = None,
     ) -> None:
         super().__init__()
         self._ring = ring_buffer
@@ -3407,6 +3821,12 @@ class MainWindow(QMainWindow):
         )
         self._clips = clips
         self._on_save_state = on_save_state
+        self._on_update_exit = on_update_exit
+        self._update_check_thread: Optional[QThread] = None
+        self._update_check_worker: Optional[_UpdateCheckWorker] = None
+        self._update_check_silent: bool = False
+        self._available_update: Optional[updater.ReleaseInfo] = None
+        self._update_dialog: Optional[UpdateDialog] = None
         self._active_popup: Optional[TrimDialog] = None
         self._active_picker: Optional[ChannelPickerDialog] = None
         self._active_snapshot: Optional[CaptureSnapshot] = None
@@ -3897,6 +4317,18 @@ class MainWindow(QMainWindow):
         footer_row.addWidget(self._startup_chk)
         footer_row.addWidget(self._tray_close_chk)
         footer_row.addStretch()
+
+        self._version_lbl = QLabel(ltr(t("main.version_label", ver=paths.APP_VERSION)))
+        self._version_lbl.setStyleSheet(f"color: #848a94; font-family: {_MONO_FONT}; font-size: 11px;")
+        footer_row.addWidget(self._version_lbl)
+
+        self._update_btn = QPushButton(t("main.check_updates_btn"))
+        self._update_btn.setObjectName("ExportCard")
+        self._update_btn.setIcon(_svg_icon("refresh", "#b4b9c2", 12))
+        self._update_btn.setIconSize(QSize(12, 12))
+        self._update_btn.setToolTip(t("main.check_updates_tooltip"))
+        self._update_btn.clicked.connect(self._on_update_button_clicked)
+        footer_row.addWidget(self._update_btn)
         footer_v.addLayout(footer_row)
 
         self._status_bar_lbl = QLabel("")
@@ -3922,6 +4354,13 @@ class MainWindow(QMainWindow):
         self._session_timer.setInterval(1500)
         self._session_timer.timeout.connect(self._refresh_listening)
         QTimer.singleShot(0, self._start_device_scan)
+
+        self._startup_update_timer = QTimer(self)
+        self._startup_update_timer.setSingleShot(True)
+        self._startup_update_timer.setInterval(4000)
+        self._startup_update_timer.timeout.connect(self._on_startup_update_timer)
+        if paths.is_frozen():
+            self._startup_update_timer.start()
 
     def _on_toggle_language(self) -> None:
         new_lang = "ar" if get_lang() == "en" else "en"
@@ -4041,6 +4480,8 @@ class MainWindow(QMainWindow):
         self._startup_chk.setToolTip(t("main.startup_tooltip"))
         self._tray_close_chk.setText(t("main.tray_close_chk"))
         self._tray_close_chk.setToolTip(t("main.tray_close_tooltip"))
+        self._version_lbl.setText(ltr(t("main.version_label", ver=paths.APP_VERSION)))
+        self._sync_update_button()
 
         self._update_duration_labels()
         self._refresh_status()
@@ -4155,10 +4596,25 @@ class MainWindow(QMainWindow):
                 self._resume_ui_timers()
 
     def shutdown(self) -> None:
-        """Stop timers, background scan/decode threads, and any open capture/trim popups cleanly."""
+        """Stop timers, background scan/decode/update threads, and any open popups cleanly."""
         self._status_restore_timer.stop()
         self._tray_trim_timer.stop()
         self._session_timer.stop()
+        self._startup_update_timer.stop()
+        if self._update_dialog is not None:
+            try:
+                self._update_dialog.cancel_active_download()
+                self._update_dialog.close()
+            except Exception:
+                pass
+            self._update_dialog = None
+        if self._update_check_thread is not None:
+            upd_thread = self._update_check_thread
+            upd_worker = self._update_check_worker
+            self._update_check_thread = None
+            self._update_check_worker = None
+            sigs = (upd_worker.finished,) if upd_worker is not None else ()
+            _detach_running_thread(upd_thread, upd_worker, wait_ms=400, signals=sigs)
         if self._toast_label is not None:
             try:
                 self._toast_label.close()
@@ -4513,6 +4969,183 @@ class MainWindow(QMainWindow):
     def _on_tray_close_toggled(self, checked: bool) -> None:
         self._config["minimize_to_tray"] = bool(checked)
         self._on_save_state(self._config, self._clips)
+
+    def _sync_update_button(self) -> None:
+        checking = self._update_check_thread is not None and self._update_check_thread.isRunning()
+        if checking and not self._update_check_silent:
+            self._update_btn.setEnabled(False)
+            self._update_btn.setText(t("main.checking_updates_btn"))
+            self._update_btn.setToolTip(t("main.check_updates_tooltip"))
+            self._update_btn.setObjectName("ExportCard")
+            self._update_btn.setIcon(_svg_icon("refresh", "#848a94", 12))
+        elif self._available_update is not None:
+            ver = self._available_update.version
+            self._update_btn.setEnabled(True)
+            self._update_btn.setText(t("main.update_available_btn", ver=ltr(ver)))
+            self._update_btn.setToolTip(t("main.update_available_tooltip", ver=ltr(ver)))
+            self._update_btn.setObjectName("Accent")
+            self._update_btn.setIcon(_svg_icon("download", "#65d692", 12))
+        else:
+            self._update_btn.setEnabled(True)
+            self._update_btn.setText(t("main.check_updates_btn"))
+            self._update_btn.setToolTip(t("main.check_updates_tooltip"))
+            self._update_btn.setObjectName("ExportCard")
+            self._update_btn.setIcon(_svg_icon("refresh", "#b4b9c2", 12))
+        self._repolish_widget(self._update_btn)
+
+    def _on_startup_update_timer(self) -> None:
+        if not paths.is_frozen():
+            return
+        self._start_update_check(silent=True)
+
+    def _on_update_button_clicked(self) -> None:
+        if self._available_update is not None:
+            self._open_update_dialog(self._available_update)
+            return
+        self._start_update_check(silent=False)
+
+    def _start_update_check(self, *, silent: bool) -> None:
+        if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            if not silent and self._update_check_silent:
+                self._update_check_silent = False
+                self._sync_update_button()
+            return
+        self._update_check_silent = bool(silent)
+        thread = QThread(self)
+        worker = _UpdateCheckWorker(timeout=8.0 if silent else 10.0)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_update_check_finished, Qt.ConnectionType.QueuedConnection)
+        self._update_check_thread = thread
+        self._update_check_worker = worker
+        self._sync_update_button()
+        thread.start()
+
+    def _format_update_check_error(self, result: updater.UpdateCheckResult) -> str:
+        code = result.error_code
+        if code == "no_releases":
+            return t("update.err_no_releases")
+        if code == "rate_limited":
+            return t("update.err_rate_limited")
+        if code == "network":
+            return t("update.err_network")
+        if code == "tls":
+            return t("update.err_tls", detail=result.error)
+        if code == "missing_assets":
+            return t("update.err_missing_assets")
+        return t("update.err_generic", detail=result.error or "Unknown error")
+
+    @Slot(object)
+    def _on_update_check_finished(self, result: updater.UpdateCheckResult) -> None:
+        silent = self._update_check_silent
+        thread = self._update_check_thread
+        self._update_check_thread = None
+        self._update_check_worker = None
+        if thread is not None:
+            thread.quit()
+            thread.wait(1500)
+
+        if result.status == "update_available" and result.release is not None:
+            self._available_update = result.release
+            self._sync_update_button()
+            if not silent:
+                self._open_update_dialog(result.release)
+            return
+
+        self._available_update = None
+        self._sync_update_button()
+        if silent:
+            return
+
+        if result.status == "up_to_date":
+            self._set_status_message(
+                t("update.up_to_date_body", ver=ltr(result.current_version)),
+                hold_ms=4000,
+                is_error=False,
+            )
+            QMessageBox.information(
+                self,
+                t("update.up_to_date_title"),
+                t("update.up_to_date_body", ver=ltr(result.current_version)),
+            )
+            return
+
+        QMessageBox.warning(
+            self,
+            t("update.check_error_title"),
+            self._format_update_check_error(result),
+        )
+
+    def _is_busy_for_update(self) -> bool:
+        if self._playing_clip_id is not None or self._fast_clip_busy:
+            return True
+        if self._active_popup is not None and self._active_popup.isVisible():
+            return True
+        if self._active_picker is not None and self._active_picker.isVisible():
+            return True
+        if self._decode_thread is not None and self._decode_thread.isRunning():
+            return True
+        if any(w.isRunning() for w in self._export_workers):
+            return True
+        if self._apo_worker is not None and self._apo_worker.isRunning():
+            return True
+        return False
+
+    def _confirm_update_if_busy(self) -> bool:
+        if not self._is_busy_for_update():
+            return True
+        ans = QMessageBox.question(
+            self,
+            t("update.busy_confirm_title"),
+            t("update.busy_confirm_body"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return False
+        self.stop_all_audio()
+        return True
+
+    def _open_update_dialog(self, release: updater.ReleaseInfo) -> None:
+        if self._update_dialog is not None and self._update_dialog.isVisible():
+            self._update_dialog.raise_()
+            self._update_dialog.activateWindow()
+            return
+        dlg = UpdateDialog(
+            release,
+            is_frozen_build=paths.is_frozen(),
+            confirm_before_download=self._confirm_update_if_busy,
+            parent=self,
+        )
+        self._update_dialog = dlg
+        verified_path: Optional[Path] = None
+        accepted = False
+        try:
+            accepted = dlg.exec() == QDialog.DialogCode.Accepted
+            verified_path = dlg.verified_installer_path
+        finally:
+            if self._update_dialog is dlg:
+                self._update_dialog = None
+            dlg.deleteLater()
+        if accepted and verified_path is not None:
+            self._apply_verified_update(verified_path)
+
+    def _apply_verified_update(self, installer_path: Path) -> None:
+        self.stop_all_audio()
+        try:
+            if self._on_update_exit is not None:
+                self._on_update_exit(installer_path)
+            else:
+                updater.launch_installer(installer_path, silent=True)
+                app = QApplication.instance()
+                if app is not None:
+                    app.quit()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                t("update.download_failed_title"),
+                t("update.download_failed_body", err=str(exc)),
+            )
 
     def _on_loopback_changed(self) -> None:
         dev = self._loopback_combo.currentData()

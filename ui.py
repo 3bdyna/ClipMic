@@ -3219,6 +3219,9 @@ class MainWindow(QMainWindow):
     language_changed = Signal(str)
 
     _BUFFER_PRESETS: tuple[int, ...] = (10, 15, 30, 60, 120)
+    _MIN_WIDTH: int = 720
+    _MIN_HEIGHT_COLLAPSED: int = 500
+    _MIN_HEIGHT_EXPANDED: int = 710
 
     def __init__(
         self,
@@ -3270,8 +3273,8 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(t("app.title"))
         self.setWindowIcon(make_app_icon())
-        self.resize(780, 700)
-        self.setMinimumSize(700, 580)
+        self.resize(780, 740)
+        self.setMinimumSize(self._MIN_WIDTH, self._MIN_HEIGHT_EXPANDED)
         self.setAcceptDrops(True)
         _install_app_style()
         self.setStyleSheet(DARK_QSS)
@@ -3416,6 +3419,9 @@ class MainWindow(QMainWindow):
         root.addLayout(toggle_row)
 
         self._setup_section = QWidget()
+        self._setup_section.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         setup_lay = QVBoxLayout(self._setup_section)
         setup_lay.setContentsMargins(0, 0, 0, 0)
         setup_lay.setSpacing(10)
@@ -3633,6 +3639,7 @@ class MainWindow(QMainWindow):
 
         # Saved Clips Scroll List
         self._scroll = QScrollArea()
+        self._scroll.setMinimumHeight(130)
         self._scroll.setWidgetResizable(True)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list_host = QWidget()
@@ -3691,6 +3698,7 @@ class MainWindow(QMainWindow):
         self.clip_playback_done.connect(self._on_clip_playback_done)
         self.loopback_status_changed.connect(self._on_loopback_status_changed)
         self.retranslate_ui()
+        self._apply_min_window_size(self._setup_toggle_btn.isChecked())
 
         self._session_timer = QTimer(self)
         self._session_timer.setInterval(1500)
@@ -3715,12 +3723,23 @@ class MainWindow(QMainWindow):
         icon_name = "chevron_down" if expanded else ("chevron_left" if is_rtl() else "chevron_right")
         self._setup_toggle_btn.setIcon(_svg_icon(icon_name, "#848a94", 13))
 
+    def _apply_min_window_size(self, expanded: bool) -> None:
+        base_h = self._MIN_HEIGHT_EXPANDED if expanded else self._MIN_HEIGHT_COLLAPSED
+        if self.centralWidget() is not None and self.centralWidget().layout() is not None:
+            self.centralWidget().layout().activate()
+        min_h = max(base_h, self.minimumSizeHint().height())
+        self.setMinimumSize(self._MIN_WIDTH, min_h)
+        if self.width() < self._MIN_WIDTH or self.height() < min_h:
+            self.resize(max(self.width(), self._MIN_WIDTH), max(self.height(), min_h))
+            ensure_on_screen(self)
+
     def _on_setup_section_toggled(self, expanded: bool) -> None:
         self._setup_section.setVisible(bool(expanded))
         self._setup_toggle_btn.setText(
             t("main.setup_toggle_expanded") if expanded else t("main.setup_toggle_collapsed")
         )
         self._update_setup_toggle_icon()
+        self._apply_min_window_size(bool(expanded))
 
     def _default_mic_item_text(self) -> str:
         if not self._devices_scanned:

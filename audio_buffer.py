@@ -1341,7 +1341,7 @@ class MicRingBuffer:
                 samplerate=in_sr,
                 channels=in_ch,
                 dtype="float32",
-                blocksize=960,
+                blocksize=1920,
                 callback=self._on_audio,
             )
             stream.start()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import gc
+import shutil
 import sys
 import time
 import uuid
@@ -57,6 +58,7 @@ from effects import (
     load_effects,
     make_preview_sample_wav,
     normalize_params,
+    probe_wav_duration,
     process_clip,
     read_wav,
     resolve_effect_filter,
@@ -2663,8 +2665,7 @@ class TrimDialog(QDialog):
             return self._rendered_dur_s
         start_s, end_s = self._waveform.trim_range()
         try:
-            audio, sr = read_wav(wav)
-            dur = max(0.05, len(audio) / float(sr))
+            dur = max(0.05, probe_wav_duration(wav))
         except Exception:
             dur = max(0.05, end_s - start_s)
         if wav == self._rendered_wav:
@@ -2710,10 +2711,12 @@ class TrimDialog(QDialog):
     def _sync_play_button(self) -> None:
         if self._is_playing:
             self._play_btn.setText(t("common.stop"))
+            self._play_btn.setIcon(_svg_icon("stop", "#f28c8c", 13))
             self._play_btn.setToolTip(t("trim.stop_tooltip"))
             self._play_btn.setObjectName("Danger")
         else:
             self._play_btn.setText(t("trim.play_preview_btn"))
+            self._play_btn.setIcon(_svg_icon("play", "#f2f3f5", 13))
             self._play_btn.setToolTip(t("trim.play_preview_tooltip"))
             self._play_btn.setObjectName("")
         self._play_btn.style().unpolish(self._play_btn)
@@ -2829,7 +2832,7 @@ class TrimDialog(QDialog):
             clip_id = self._existing.id if self._existing else uuid.uuid4().hex[:8]
             safe_slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in name).strip("_") or "clip"
             dest = clips_root / f"{safe_slug[:28]}_{clip_id}.wav"
-            dest.write_bytes(wav.read_bytes())
+            shutil.copy2(wav, dest)
             if self._existing:
                 old_path = resolve_clip_path(self._existing.file)
                 if old_path != dest and old_path.is_file():
@@ -2838,8 +2841,7 @@ class TrimDialog(QDialog):
                     except OSError:
                         pass
 
-            audio, sr = read_wav(dest)
-            dur = len(audio) / float(sr)
+            dur = probe_wav_duration(dest)
             fx_name = self._current_effect()["name"]
             preset_label = (
                 self._existing.preset
@@ -4183,20 +4185,25 @@ class MainWindow(QMainWindow):
         self._refresh_status()
         self._refresh_listening()
 
+    def _apply_listening_ui(self, text: str, text_color: str, dot_color: str) -> None:
+        state = (text, text_color, dot_color)
+        if getattr(self, "_last_listening_ui", None) == state:
+            return
+        self._last_listening_ui = state
+        self._listening_label.setText(text)
+        self._listening_label.setStyleSheet(f"color: {text_color}; font-family: {_MONO_FONT}; font-size: 11px;")
+        self._listen_dot.setStyleSheet(f"background-color: {dot_color}; border-radius: 2px; border: none;")
+
     def _refresh_listening(self) -> None:
         secs = self._buffer_seconds()
         sr = int(getattr(self._ring, "sample_rate", 48000))
         if self._ring.is_reconnecting:
             detail = f" ({self._ring.last_error})" if self._ring.last_error else ""
-            self._listening_label.setText(t("main.listening_reconnecting", detail=detail))
-            self._listening_label.setStyleSheet(f"color: #fbbf24; font-family: {_MONO_FONT}; font-size: 11px;")
-            self._listen_dot.setStyleSheet("background-color: #fbbf24; border-radius: 2px; border: none;")
+            self._apply_listening_ui(t("main.listening_reconnecting", detail=detail), "#fbbf24", "#fbbf24")
             self._telemetry_strip.update_telemetry(secs, sr, False)
             return
         if not self._ring.is_running:
-            self._listening_label.setText(t("main.listening_stopped"))
-            self._listening_label.setStyleSheet(f"color: #f28c8c; font-family: {_MONO_FONT}; font-size: 11px;")
-            self._listen_dot.setStyleSheet("background-color: #f28c8c; border-radius: 2px; border: none;")
+            self._apply_listening_ui(t("main.listening_stopped"), "#f28c8c", "#f28c8c")
             self._telemetry_strip.update_telemetry(secs, sr, False)
             return
         apps = self._ring.refresh_active_sessions()
@@ -4207,7 +4214,6 @@ class MainWindow(QMainWindow):
             dev_short = raw_dev or t("main.loopback_default")
         active_now = self._ring.is_receiving_audio()
         self._telemetry_strip.update_telemetry(secs, sr, active_now)
-        color = "#65d692" if active_now else "#65d692"
         dot_color = "#65d692" if active_now else "#2a4735"
         apps_txt = ", ".join(apps[:5]) if apps else t("main.listening_waiting")
         mic_tag = (
@@ -4216,9 +4222,11 @@ class MainWindow(QMainWindow):
             else t("main.mic_buf_unavailable")
         )
         mode_tag = t("main.mode_per_app_outputs") if getattr(self._ring, "mode", "") == "procloop" else dev_short
-        self._listening_label.setText(t("main.listening_line", dot="", apps=apps_txt, mode=mode_tag, mic=mic_tag))
-        self._listening_label.setStyleSheet(f"color: {color}; font-family: {_MONO_FONT}; font-size: 11px;")
-        self._listen_dot.setStyleSheet(f"background-color: {dot_color}; border-radius: 2px; border: none;")
+        self._apply_listening_ui(
+            t("main.listening_line", dot="", apps=apps_txt, mode=mode_tag, mic=mic_tag),
+            "#65d692",
+            dot_color,
+        )
 
     def _current_mic_guid(self) -> Optional[str]:
         return self._mic_guids.get(self._mic_combo.currentData())

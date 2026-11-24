@@ -195,6 +195,27 @@ class DirectMicRing:
                 self._file = None
 
 
+def _default_wasapi_output_device() -> Optional[int]:
+    """Return Windows WASAPI default output device index for low-latency speaker playback."""
+    try:
+        hostapis = sd.query_hostapis()
+        for h in hostapis:
+            if "WASAPI" in str(h.get("name", "")).upper():
+                out_idx = h.get("default_output_device")
+                if out_idx is not None and int(out_idx) >= 0:
+                    return int(out_idx)
+    except Exception:
+        pass
+    return None
+
+
+def _close_stream_quietly(stream: sd.OutputStream) -> None:
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
 def _to_48k_mono(audio: np.ndarray, sample_rate: int) -> np.ndarray:
     arr = np.asarray(audio)
     if np.issubdtype(arr.dtype, np.integer):
@@ -567,24 +588,54 @@ class MicInjector:
 
         def finished():
             my_stream = holder["stream"]
+            should_close = False
             with self._lock:
                 if self._stream is my_stream:
                     self._stream = None
-            if my_stream is not None and not stop_evt.is_set():
-                try:
-                    my_stream.close()
-                except Exception:
-                    pass
+                    should_close = True
             on_done()
+            # Never call Pa_CloseStream inside PortAudio's finished_callback; close off-thread.
+            if should_close and my_stream is not None:
+                threading.Thread(
+                    target=_close_stream_quietly,
+                    args=(my_stream,),
+                    name="ClipMic-StreamClose",
+                    daemon=True,
+                ).start()
 
-        try:
-            stream = sd.OutputStream(
+        def _open_output_stream() -> sd.OutputStream:
+            wasapi_out = _default_wasapi_output_device()
+            if wasapi_out is not None:
+                extra = None
+                if hasattr(sd, "WasapiSettings"):
+                    try:
+                        extra = sd.WasapiSettings(auto_convert=True)
+                    except Exception:
+                        extra = None
+                try:
+                    return sd.OutputStream(
+                        device=wasapi_out,
+                        samplerate=sample_rate,
+                        channels=channels,
+                        dtype="float32",
+                        latency="low",
+                        extra_settings=extra,
+                        callback=callback,
+                        finished_callback=finished,
+                    )
+                except Exception as exc:
+                    _log.debug("WASAPI output open failed (%d Hz, %dch), falling back: %s", sample_rate, channels, exc)
+            return sd.OutputStream(
                 samplerate=sample_rate,
                 channels=channels,
                 dtype="float32",
+                latency="low",
                 callback=callback,
                 finished_callback=finished,
             )
+
+        try:
+            stream = _open_output_stream()
             holder["stream"] = stream
             with self._lock:
                 if gen != self._play_gen or stop_evt.is_set():

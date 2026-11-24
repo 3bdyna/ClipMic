@@ -460,6 +460,15 @@ def probe_wav_format(path: str | Path) -> tuple[int, int]:
         return 48000, 2
 
 
+def probe_wav_duration(path: str | Path) -> float:
+    """Return WAV duration in seconds by reading only its 44-byte header (zero PCM decode)."""
+    with wave.open(str(path), "rb") as wf:
+        sr = int(wf.getframerate())
+        if sr <= 0:
+            return 0.0
+        return wf.getnframes() / float(sr)
+
+
 def build_filter_chain(
     preset: str,
     sample_rate: int,

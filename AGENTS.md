@@ -43,6 +43,9 @@ Flat root architecture (keep source files minimal and avoid over-abstraction):
 6. **Non-Intrusive Startup Checks:** Background startup update checks run ONLY in frozen builds (`paths.is_frozen()`), fail silently offline, and NEVER show modal dialogs on startup.
 7. **DirectMic APO DLL Upgrades:** `clipmic_apo.dll` is installed to `%ProgramData%\ClipMic\MicPlugin\` only via explicit elevated `apo_setup.py` flow when a user enables Direct Mic. Never silently modify Windows registry or `Audiosrv` from the per-user installer; if a future release updates `clipmic_apo.dll`, users refresh it via Disable Mic → Enable Mic.
 8. **Network Policy:** No telemetry and no third-party media/audio downloaders. The ONLY permitted outbound network traffic is `updater.py` querying and downloading hash-verified releases from `paths.GITHUB_REPO` on GitHub Releases.
+9. **Explicit Release Gate:** Never bump `paths.APP_VERSION`, create git tags, or run `-Publish` unless the user explicitly says `"publish update"` (or asks to release).
+10. **Auto-Apply Local App Updates:** After any app code/UI edit (skip for docs-only edits like `README.md`/`AGENTS.md`), once unit tests pass and changes are committed/pushed, automatically run `.\scripts\build_release.ps1 -SkipTests -InstallLocal` so the user's installed app updates in-place and relaunches automatically.
+11. **2-Word Publish Workflow (`publish update`):** When the user says `"publish update"`, check if tag `v<APP_VERSION>` already exists on GitHub; if so, auto-bump the patch version in `paths.py`, run tests, commit & push to `origin/main`, and run `.\scripts\build_release.ps1 -Publish`.
 
 ## Workspace & Coding Rules
 - Follow `GEMINI.md` strictly:

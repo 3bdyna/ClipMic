@@ -14,6 +14,8 @@ param(
     [switch]$SkipBuild,
     [switch]$Publish,
     [switch]$Draft,
+    [switch]$InstallLocal,
+    [switch]$SkipLocalInstall,
     [string]$Notes = "",
     [string]$NotesFile = ""
 )
@@ -85,6 +87,74 @@ function Invoke-Native {
         }
         throw "Command '$FilePath' failed (exit code $script:LastNativeExitCode)."
     }
+}
+
+function Stop-RunningClipMic {
+    $targetPids = @()
+    $exeProcs = Get-Process -Name "ClipMic" -ErrorAction SilentlyContinue
+    if ($exeProcs) {
+        $targetPids += ($exeProcs | Select-Object -ExpandProperty Id)
+    }
+    $pyProcs = Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and ($_.CommandLine -match 'ClipMic[/\\]main\.py') }
+    if ($pyProcs) {
+        $targetPids += ($pyProcs | Select-Object -ExpandProperty ProcessId)
+    }
+    $targetPids = @($targetPids | Select-Object -Unique)
+    if ($targetPids.Count -eq 0) {
+        return
+    }
+
+    Write-Host "[InstallLocal] Stopping running ClipMic process(es): $($targetPids -join ', ')..." -ForegroundColor Cyan
+    foreach ($procId in $targetPids) {
+        $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+            $null = $p.CloseMainWindow()
+        }
+    }
+
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline) {
+        $alive = @()
+        foreach ($procId in $targetPids) {
+            if (Get-Process -Id $procId -ErrorAction SilentlyContinue) {
+                $alive += $procId
+            }
+        }
+        if ($alive.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+
+    foreach ($procId in $targetPids) {
+        if (Get-Process -Id $procId -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Start-Sleep -Milliseconds 300
+}
+
+function Invoke-LocalInstall {
+    param(
+        [string]$InstallerPath,
+        [string]$Version
+    )
+    Stop-RunningClipMic
+    Write-Host "[InstallLocal] Running silent in-place installer..." -ForegroundColor Cyan
+    $installerArgs = @(
+        "/SILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/CLOSEAPPLICATIONS",
+        "/FORCECLOSEAPPLICATIONS",
+        "/RELAUNCH"
+    )
+    $proc = Start-Process -FilePath $InstallerPath -ArgumentList $installerArgs -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+        throw "Local installer failed with exit code $($proc.ExitCode)."
+    }
+    Write-Host "[InstallLocal] Local installed ClipMic updated to $Version and relaunched." -ForegroundColor Green
 }
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -238,36 +308,40 @@ try {
     Write-Host "Checksums : $sumsPath"
     Write-Host "=======================================================" -ForegroundColor Green
 
-    if (-not $Publish) {
+    if ($Publish) {
+        $ghArgs = @(
+            "release", "create", $tag,
+            $installerPath, $sumsPath,
+            "--title", "ClipMic $tag"
+        )
+        if ($Draft) {
+            $ghArgs += "--draft"
+        }
+        if ($NotesFile) {
+            if (-not (Test-Path $NotesFile)) {
+                throw "NotesFile not found: $NotesFile"
+            }
+            $ghArgs += @("--notes-file", $NotesFile)
+        } elseif ($Notes) {
+            $ghArgs += @("--notes", $Notes)
+        } else {
+            $ghArgs += "--generate-notes"
+        }
+
+        Write-Host ""
+        Write-Host "[Publish] Creating GitHub release $tag..." -ForegroundColor Cyan
+        Invoke-Native -FilePath "gh" -ArgumentList $ghArgs -FailureMessage "gh release create failed"
+        Write-Host "[Publish] Release $tag published successfully." -ForegroundColor Green
+    } elseif (-not $InstallLocal) {
         Write-Host ""
         Write-Host "Next step to publish to GitHub Releases:" -ForegroundColor Yellow
         Write-Host "  .\scripts\build_release.ps1 -SkipBuild -SkipTests -Publish"
-        return
     }
 
-    $ghArgs = @(
-        "release", "create", $tag,
-        $installerPath, $sumsPath,
-        "--title", "ClipMic $tag"
-    )
-    if ($Draft) {
-        $ghArgs += "--draft"
+    if ($InstallLocal -or ($Publish -and -not $SkipLocalInstall)) {
+        Write-Host ""
+        Invoke-LocalInstall -InstallerPath $installerPath -Version $version
     }
-    if ($NotesFile) {
-        if (-not (Test-Path $NotesFile)) {
-            throw "NotesFile not found: $NotesFile"
-        }
-        $ghArgs += @("--notes-file", $NotesFile)
-    } elseif ($Notes) {
-        $ghArgs += @("--notes", $Notes)
-    } else {
-        $ghArgs += "--generate-notes"
-    }
-
-    Write-Host ""
-    Write-Host "[Publish] Creating GitHub release $tag..." -ForegroundColor Cyan
-    Invoke-Native -FilePath "gh" -ArgumentList $ghArgs -FailureMessage "gh release create failed"
-    Write-Host "[Publish] Release $tag published successfully." -ForegroundColor Green
 } finally {
     Pop-Location
 }

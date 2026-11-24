@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import gc
+import re
 import shutil
 import sys
 import time
@@ -78,10 +79,14 @@ from effects import (
 from native.directmic import apo_setup
 from hotkeys import (
     DEFAULT_BUFFER_SECONDS,
+    DEFAULT_FAST_CLIP_SECONDS,
     MAX_BUFFER_SECONDS,
+    MAX_FAST_CLIP_SECONDS,
     MIN_BUFFER_SECONDS,
+    MIN_FAST_CLIP_SECONDS,
     ClipEntry,
     clamp_buffer_seconds,
+    clamp_fast_clip_seconds,
     parse_hotkey,
     resolve_clip_path,
     save_config,
@@ -1149,6 +1154,112 @@ class _RenderWorker(QObject):
             self.finished.emit(str(self.dst), "")
         except Exception as exc:
             self.finished.emit("", str(exc))
+
+
+class _FastClipWorker(QObject):
+    """Background worker that persists a Fast Clip source bundle and renders its output WAV."""
+
+    finished = Signal(object, str)  # ClipEntry | None, error
+
+    def __init__(
+        self,
+        *,
+        sliced_snap: Optional[CaptureSnapshot],
+        selected_keys: list[str],
+        fallback_audio: Optional[np.ndarray],
+        fallback_sr: int,
+        channel_label: str,
+        effect_id: str,
+        clip_id: str,
+        created_ts: str,
+    ) -> None:
+        super().__init__()
+        self.sliced_snap = sliced_snap
+        self.selected_keys = list(selected_keys)
+        self.fallback_audio = fallback_audio
+        self.fallback_sr = int(fallback_sr)
+        self.channel_label = channel_label
+        self.effect_id = effect_id
+        self.clip_id = clip_id
+        self.created_ts = created_ts
+
+    def run(self) -> None:
+        tmp_wav: Optional[Path] = None
+        try:
+            effects_list = load_effects()
+            fx = next((item for item in effects_list if item.get("id") == self.effect_id), None)
+            if fx is None:
+                fx = next((item for item in effects_list if item.get("id") == "normal"), None)
+            resolved_fx_id = str(fx["id"]) if fx else "normal"
+            fx_display_name = str(fx["name"]) if fx else "Normal"
+
+            src_dir = paths.clip_sources_dir() / self.clip_id
+            if self.sliced_snap is not None:
+                save_snapshot_bundle(self.sliced_snap, src_dir, self.selected_keys)
+                audio_i16, sr = self.sliced_snap.mix(self.selected_keys)
+                self.sliced_snap.release()
+                self.sliced_snap = None
+            else:
+                if self.fallback_audio is None or self.fallback_audio.size == 0:
+                    self.finished.emit(None, "Empty audio")
+                    return
+                src_dir.mkdir(parents=True, exist_ok=True)
+                write_wav(src_dir / "original.wav", self.fallback_audio, self.fallback_sr)
+                audio_i16 = self.fallback_audio
+                sr = self.fallback_sr
+
+            if audio_i16.size == 0 or sr <= 0:
+                self.finished.emit(None, "Empty audio")
+                return
+
+            actual_duration_s = float(len(audio_i16)) / float(sr)
+            safe_slug = re.sub(r"[^A-Za-z0-9_-]+", "_", self.channel_label).strip("_") or "clip"
+            dest = paths.clips_dir() / f"fast_{safe_slug[:24]}_{self.clip_id}.wav"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+
+            if resolved_fx_id == "normal":
+                write_wav(dest, audio_i16, sr)
+            else:
+                tmp_wav = paths.temp_dir() / f"fast_tmp_{self.clip_id}.wav"
+                write_wav(tmp_wav, audio_i16, sr)
+                process_clip(
+                    tmp_wav,
+                    dest,
+                    preset=resolved_fx_id,
+                    start_s=0.0,
+                    end_s=None,
+                    effects_list=effects_list,
+                )
+
+            dur_rounded = round(actual_duration_s, 2)
+            entry = ClipEntry(
+                id=self.clip_id,
+                name=f"Fast {self.channel_label} {self.created_ts}",
+                file=str(dest.relative_to(paths.user_data_dir())),
+                hotkey="",
+                preset=fx_display_name,
+                duration=dur_rounded,
+                source_dir=f"clips/_sources/{self.clip_id}",
+                selected_keys=list(self.selected_keys),
+                trim_start=0.0,
+                trim_end=dur_rounded,
+                effect_id=resolved_fx_id,
+            )
+            self.finished.emit(entry, "")
+        except Exception as exc:
+            self.finished.emit(None, str(exc))
+        finally:
+            if self.sliced_snap is not None:
+                try:
+                    self.sliced_snap.release()
+                except Exception:
+                    pass
+                self.sliced_snap = None
+            if tmp_wav is not None and tmp_wav.is_file():
+                try:
+                    tmp_wav.unlink()
+                except OSError:
+                    pass
 
 
 def _describe_effect(effect: dict) -> str:
@@ -3263,6 +3374,7 @@ class MainWindow(QMainWindow):
     """Minimal dark soundboard & capture controller."""
 
     capture_requested = Signal()
+    fast_clip_requested = Signal()
     play_clip_requested = Signal(str)
     stop_audio_requested = Signal()
     clip_playback_done = Signal(int)
@@ -3290,6 +3402,9 @@ class MainWindow(QMainWindow):
         self._config["buffer_seconds"] = clamp_buffer_seconds(
             self._config.get("buffer_seconds", DEFAULT_BUFFER_SECONDS)
         )
+        self._config["fast_clip_seconds"] = clamp_fast_clip_seconds(
+            self._config.get("fast_clip_seconds", DEFAULT_FAST_CLIP_SECONDS)
+        )
         self._clips = clips
         self._on_save_state = on_save_state
         self._active_popup: Optional[TrimDialog] = None
@@ -3299,6 +3414,9 @@ class MainWindow(QMainWindow):
         self._active_capture_wav: Optional[Path] = None
         self._editing_clip: Optional[ClipEntry] = None
         self._transitioning_session: bool = False
+        self._fast_clip_busy: bool = False
+        self._fast_clip_thread: Optional[QThread] = None
+        self._fast_clip_worker: Optional[_FastClipWorker] = None
         self._toast_label: Optional[QLabel] = None
         self._tmp_capture_dir = paths.temp_dir()
         self._scan_thread: Optional[QThread] = None
@@ -3447,6 +3565,52 @@ class MainWindow(QMainWindow):
         cap_lay.addWidget(self._stop_hk_lbl)
         cap_lay.addWidget(self._stop_hotkey_btn)
         cap_outer.addLayout(cap_lay)
+
+        fast_lay = QHBoxLayout()
+        fast_lay.setSpacing(6)
+        fast_hk = str(self._config.get("fast_clip_hotkey", "F8") or "")
+        fast_secs = self._fast_clip_seconds()
+
+        self._fast_clip_btn = QPushButton()
+        self._fast_clip_btn.setIcon(_svg_icon("play", "#f2f3f5", 12))
+        self._fast_clip_btn.setIconSize(QSize(12, 12))
+        self._fast_clip_btn.setMinimumHeight(30)
+        self._fast_clip_btn.clicked.connect(self.fast_clip_capture)
+
+        self._fast_hk_lbl = QLabel(t("main.fast_clip_hk_label"))
+        self._fast_hk_lbl.setStyleSheet("color: #848a94; font-size: 11px; font-weight: 600;")
+        self._fast_hotkey_btn = HotkeyCaptureButton(fast_hk, allow_empty=True)
+        self._fast_hotkey_btn.setMinimumHeight(28)
+        self._fast_hotkey_btn.hotkey_changed.connect(self._on_fast_clip_hotkey_changed)
+
+        self._fast_sec_lbl = QLabel(t("main.fast_clip_sec_label"))
+        self._fast_sec_lbl.setStyleSheet("color: #848a94; font-size: 11px; font-weight: 600;")
+        self._fast_sec_spin = QSpinBox()
+        self._fast_sec_spin.setButtonSymbols(QSpinBox.ButtonSymbols.PlusMinus)
+        self._fast_sec_spin.setRange(MIN_FAST_CLIP_SECONDS, MAX_FAST_CLIP_SECONDS)
+        self._fast_sec_spin.setValue(fast_secs)
+        self._fast_sec_spin.setSuffix(t("main.buffer_spin_suffix"))
+        self._fast_sec_spin.setFixedWidth(74)
+        self._fast_sec_spin.setMinimumHeight(28)
+        self._fast_sec_spin.setKeyboardTracking(False)
+        self._fast_sec_spin.valueChanged.connect(self._on_fast_clip_seconds_changed)
+
+        self._fast_fx_lbl = QLabel(t("main.fast_clip_fx_label"))
+        self._fast_fx_lbl.setStyleSheet("color: #848a94; font-size: 11px; font-weight: 600;")
+        self._fast_fx_combo = QComboBox()
+        self._fast_fx_combo.setMinimumHeight(28)
+        self._fast_fx_combo.setMinimumWidth(120)
+        self._reload_fast_clip_effects()
+        self._fast_fx_combo.currentIndexChanged.connect(self._on_fast_clip_effect_changed)
+
+        fast_lay.addWidget(self._fast_clip_btn, 1)
+        fast_lay.addWidget(self._fast_hk_lbl)
+        fast_lay.addWidget(self._fast_hotkey_btn)
+        fast_lay.addWidget(self._fast_sec_lbl)
+        fast_lay.addWidget(self._fast_sec_spin)
+        fast_lay.addWidget(self._fast_fx_lbl)
+        fast_lay.addWidget(self._fast_fx_combo)
+        cap_outer.addLayout(fast_lay)
 
         self._telemetry_strip = _OledTelemetryStrip()
         self._telemetry_strip.update_telemetry(
@@ -3746,6 +3910,7 @@ class MainWindow(QMainWindow):
         central_v.addWidget(footer_strip)
 
         self.capture_requested.connect(self.capture_last_30s)
+        self.fast_clip_requested.connect(self.fast_clip_capture)
         self.play_clip_requested.connect(self.play_clip_by_id)
         self.stop_audio_requested.connect(self.stop_all_audio)
         self.clip_playback_done.connect(self._on_clip_playback_done)
@@ -3817,6 +3982,16 @@ class MainWindow(QMainWindow):
         self._stop_hotkey_btn.setToolTip(t("main.stop_hk_tooltip"))
         self._cap_hotkey_btn.retranslate_ui()
         self._stop_hotkey_btn.retranslate_ui()
+        self._fast_hk_lbl.setText(t("main.fast_clip_hk_label"))
+        self._fast_hotkey_btn.retranslate_ui()
+        self._fast_sec_lbl.setText(t("main.fast_clip_sec_label"))
+        self._fast_sec_spin.setSuffix(t("main.buffer_spin_suffix"))
+        self._fast_sec_spin.setToolTip(
+            t("main.fast_clip_sec_tooltip", min=MIN_FAST_CLIP_SECONDS, max=MAX_FAST_CLIP_SECONDS)
+        )
+        self._fast_fx_lbl.setText(t("main.fast_clip_fx_label"))
+        self._fast_fx_combo.setToolTip(t("main.fast_clip_fx_tooltip"))
+        self._reload_fast_clip_effects()
 
         self._setup_toggle_btn.setText(
             t("main.setup_toggle_expanded")
@@ -4008,6 +4183,11 @@ class MainWindow(QMainWindow):
         if self._apo_worker is not None and self._apo_worker.isRunning():
             self._apo_worker.wait(500)
         self._apo_worker = None
+        if self._fast_clip_thread is not None and self._fast_clip_thread.isRunning():
+            self._fast_clip_thread.quit()
+            self._fast_clip_thread.wait(500)
+        self._fast_clip_thread = None
+        self._fast_clip_worker = None
         if self._pending_import_wav is not None and self._pending_import_wav.is_file():
             try:
                 self._pending_import_wav.unlink()
@@ -4018,6 +4198,9 @@ class MainWindow(QMainWindow):
     def _buffer_seconds(self) -> int:
         return clamp_buffer_seconds(self._config.get("buffer_seconds", DEFAULT_BUFFER_SECONDS))
 
+    def _fast_clip_seconds(self) -> int:
+        return clamp_fast_clip_seconds(self._config.get("fast_clip_seconds", DEFAULT_FAST_CLIP_SECONDS))
+
     def _update_duration_labels(self) -> None:
         secs = self._buffer_seconds()
         cap_hk = str(self._config.get("capture_hotkey", "F9") or "F9").strip()
@@ -4027,6 +4210,16 @@ class MainWindow(QMainWindow):
             self._capture_btn.setText(t("main.clip_last_no_hk", n=secs))
         self._capture_btn.setToolTip(t("main.clip_last_tooltip", n=secs))
         self._cap_hotkey_btn.setToolTip(t("main.clip_hk_tooltip", n=secs))
+
+        fast_secs = self._fast_clip_seconds()
+        fast_hk = str(self._config.get("fast_clip_hotkey", "") or "").strip()
+        if fast_hk:
+            self._fast_clip_btn.setText(t("main.fast_clip_btn", n=fast_secs, hk=ltr(fast_hk)))
+        else:
+            self._fast_clip_btn.setText(t("main.fast_clip_btn_no_hk", n=fast_secs))
+        self._fast_clip_btn.setToolTip(t("main.fast_clip_tooltip", n=fast_secs))
+        self._fast_hotkey_btn.setToolTip(t("main.fast_clip_hk_tooltip"))
+
         self._telemetry_strip.update_telemetry(
             secs,
             int(getattr(self._ring, "sample_rate", 48000)),
@@ -4048,14 +4241,55 @@ class MainWindow(QMainWindow):
             self._buf_spin.blockSignals(True)
             self._buf_spin.setValue(secs)
             self._buf_spin.blockSignals(False)
+        target_dur = max(secs, self._fast_clip_seconds())
         if secs != prev and hasattr(self._ring, "set_duration"):
             try:
-                self._ring.set_duration(float(secs))
+                self._ring.set_duration(float(target_dur))
             except Exception as exc:
                 self._show_status_toast(t("main.status_buffer_error", err=exc))
         self._update_duration_labels()
         self._on_save_state(self._config, self._clips)
         self.buffer_duration_changed.emit(secs)
+
+    def _on_fast_clip_hotkey_changed(self, hk: str) -> None:
+        self._config["fast_clip_hotkey"] = hk
+        self._update_duration_labels()
+        self._persist_and_bind()
+
+    def _on_fast_clip_seconds_changed(self, seconds: int) -> None:
+        secs = clamp_fast_clip_seconds(seconds)
+        self._config["fast_clip_seconds"] = secs
+        if self._fast_sec_spin.value() != secs:
+            self._fast_sec_spin.blockSignals(True)
+            self._fast_sec_spin.setValue(secs)
+            self._fast_sec_spin.blockSignals(False)
+        target_dur = max(self._buffer_seconds(), secs)
+        if hasattr(self._ring, "set_duration"):
+            try:
+                self._ring.set_duration(float(target_dur))
+            except Exception as exc:
+                self._show_status_toast(t("main.status_buffer_error", err=exc))
+        self._update_duration_labels()
+        self._on_save_state(self._config, self._clips)
+
+    def _reload_fast_clip_effects(self) -> None:
+        effects_list = load_effects()
+        target_id = str(self._config.get("fast_clip_effect", "normal") or "normal")
+        if not any(fx["id"] == target_id for fx in effects_list):
+            target_id = "normal"
+            self._config["fast_clip_effect"] = "normal"
+        self._fast_fx_combo.blockSignals(True)
+        self._fast_fx_combo.clear()
+        for fx in effects_list:
+            self._fast_fx_combo.addItem(localize_effect_name(fx["id"], fx["name"]), fx["id"])
+        idx = self._fast_fx_combo.findData(target_id)
+        self._fast_fx_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._fast_fx_combo.blockSignals(False)
+
+    def _on_fast_clip_effect_changed(self, _idx: int) -> None:
+        fx_id = str(self._fast_fx_combo.currentData() or "normal")
+        self._config["fast_clip_effect"] = fx_id
+        self._on_save_state(self._config, self._clips)
 
     def dragEnterEvent(self, event) -> None:
         if _first_supported_media_url(event.mimeData()) is not None:
@@ -4740,6 +4974,7 @@ class MainWindow(QMainWindow):
         )
 
         def _sync_open_trim() -> None:
+            self._reload_fast_clip_effects()
             if self._active_popup is not None:
                 try:
                     self._active_popup.reload_effects(select_id=dlg.last_saved_id)
@@ -4797,6 +5032,18 @@ class MainWindow(QMainWindow):
         dlg.raise_()
         dlg.activateWindow()
 
+    def _register_clip(self, entry: ClipEntry) -> None:
+        replaced = False
+        for i, existing in enumerate(self._clips):
+            if existing.id == entry.id:
+                self._clips[i] = entry
+                replaced = True
+                break
+        if not replaced:
+            self._clips.insert(0, entry)
+        self._rebuild_clip_list()
+        self._persist_and_bind()
+
     def _on_clip_saved(self, entry: ClipEntry) -> None:
         if self._active_snapshot is not None:
             src_dir = paths.clip_sources_dir() / entry.id
@@ -4822,16 +5069,104 @@ class MainWindow(QMainWindow):
                 shutil.copy2(src_wav, src_dir / "original.wav")
                 entry.source_dir = f"clips/_sources/{entry.id}"
 
-        replaced = False
-        for i, existing in enumerate(self._clips):
-            if existing.id == entry.id:
-                self._clips[i] = entry
-                replaced = True
-                break
-        if not replaced:
-            self._clips.insert(0, entry)
-        self._rebuild_clip_list()
-        self._persist_and_bind()
+        self._register_clip(entry)
+
+    def fast_clip_capture(self) -> None:
+        if self._fast_clip_busy:
+            return
+        self._fast_clip_busy = True
+        fast_secs = self._fast_clip_seconds()
+
+        sliced_snap: Optional[CaptureSnapshot] = None
+        selected_keys: list[str] = []
+        fallback_audio: Optional[np.ndarray] = None
+        fallback_sr = 48000
+        channel_label = "Audio"
+
+        if hasattr(self._ring, "snapshot_channels"):
+            snap = self._ring.snapshot_channels()
+            if not snap.is_empty:
+                sliced_snap = snap.slice_seconds(float(fast_secs))
+                snap.release()
+                selected_keys = sliced_snap.fast_clip_selected_keys()
+                if not selected_keys and sliced_snap.channels:
+                    selected_keys = [sliced_snap.channels[0].key]
+                first_ch = sliced_snap.channel_by_key(selected_keys[0]) if selected_keys else None
+                if first_ch is not None and first_ch.name:
+                    channel_label = first_ch.name
+            else:
+                snap.release()
+
+        if sliced_snap is None:
+            audio, sr = self._ring.snapshot()
+            if audio.size > 0 and sr > 0:
+                target_frames = max(1, int(round(float(fast_secs) * float(sr))))
+                fallback_audio = audio[-target_frames:].copy() if len(audio) > target_frames else audio.copy()
+                fallback_sr = int(sr)
+
+        has_snap_audio = (
+            sliced_snap is not None
+            and bool(selected_keys)
+            and any(
+                (ch := sliced_snap.channel_by_key(k)) is not None and ch.audio.size > 0
+                for k in selected_keys
+            )
+        )
+        has_fallback_audio = fallback_audio is not None and fallback_audio.size > 0
+        if not has_snap_audio and not has_fallback_audio:
+            if sliced_snap is not None:
+                sliced_snap.release()
+            self._show_status_toast(t("main.status_no_audio", n=fast_secs))
+            self._fast_clip_busy = False
+            return
+
+        self._show_status_toast(t("main.fast_clip_capturing", n=fast_secs), duration_ms=2000)
+        clip_id = uuid.uuid4().hex[:8]
+        created_ts = time.strftime("%H:%M:%S")
+        effect_id = str(self._config.get("fast_clip_effect", "normal") or "normal")
+
+        thread = QThread(self)
+        worker = _FastClipWorker(
+            sliced_snap=sliced_snap,
+            selected_keys=selected_keys,
+            fallback_audio=fallback_audio,
+            fallback_sr=fallback_sr,
+            channel_label=channel_label,
+            effect_id=effect_id,
+            clip_id=clip_id,
+            created_ts=created_ts,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_fast_clip_finished, Qt.ConnectionType.QueuedConnection)
+        self._fast_clip_thread = thread
+        self._fast_clip_worker = worker
+        thread.start()
+
+    @Slot(object, str)
+    def _on_fast_clip_finished(self, entry: Optional[ClipEntry], err: str) -> None:
+        thread = self._fast_clip_thread
+        self._fast_clip_thread = None
+        self._fast_clip_worker = None
+        if thread is not None:
+            thread.quit()
+            thread.wait(500)
+            thread.deleteLater()
+        self._fast_clip_busy = False
+
+        if err or entry is None:
+            self._show_status_toast(t("main.fast_clip_failed", err=err or "Unknown error"))
+            return
+
+        self._register_clip(entry)
+        self._injector.refresh_apo_status()
+        if self._injector.apo_installed and self._injector.ensure_ring_ready():
+            self._start_saved_clip(entry.id, mode="mic")
+        else:
+            mon, _, _ = self.get_volumes()
+            if mon:
+                self._start_saved_clip(entry.id, mode="preview")
+            self._show_status_toast(t("main.fast_clip_saved_no_mic", name=entry.name))
 
     def _edit_clip(self, entry: ClipEntry) -> None:
         src_dir = resolve_clip_path(entry.source_dir) if entry.source_dir else None

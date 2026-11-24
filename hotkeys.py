@@ -19,9 +19,16 @@ MIN_BUFFER_SECONDS = 5
 MAX_BUFFER_SECONDS = 180
 DEFAULT_BUFFER_SECONDS = 30
 
+MIN_FAST_CLIP_SECONDS = 2
+MAX_FAST_CLIP_SECONDS = 60
+DEFAULT_FAST_CLIP_SECONDS = 8
+
 DEFAULT_CONFIG = {
     "capture_hotkey": "F9",
     "stop_hotkey": "F10",
+    "fast_clip_hotkey": "F8",
+    "fast_clip_seconds": DEFAULT_FAST_CLIP_SECONDS,
+    "fast_clip_effect": "normal",
     "monitor_enabled": True,
     "monitor_volume": 0.85,
     "mic_volume": 1.0,
@@ -52,6 +59,15 @@ def clamp_buffer_seconds(value: object) -> int:
     except (TypeError, ValueError):
         return DEFAULT_BUFFER_SECONDS
     return max(MIN_BUFFER_SECONDS, min(MAX_BUFFER_SECONDS, secs))
+
+
+def clamp_fast_clip_seconds(val: object) -> int:
+    """Validate and clamp fast clip duration to [2, 60] seconds."""
+    try:
+        secs = int(round(float(val)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_FAST_CLIP_SECONDS
+    return max(MIN_FAST_CLIP_SECONDS, min(MAX_FAST_CLIP_SECONDS, secs))
 
 # Win32 RegisterHotKey constants
 MOD_ALT = 0x0001
@@ -153,6 +169,13 @@ def load_config(path: Optional[Path] = None) -> dict:
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             _log.warning("Could not parse config file %s (%s); using defaults.", target, exc)
     cfg["buffer_seconds"] = clamp_buffer_seconds(cfg.get("buffer_seconds", DEFAULT_BUFFER_SECONDS))
+    cfg["fast_clip_seconds"] = clamp_fast_clip_seconds(
+        cfg.get("fast_clip_seconds", DEFAULT_FAST_CLIP_SECONDS)
+    )
+    if not isinstance(cfg.get("fast_clip_hotkey"), str):
+        cfg["fast_clip_hotkey"] = DEFAULT_CONFIG["fast_clip_hotkey"]
+    if not isinstance(cfg.get("fast_clip_effect"), str) or not cfg["fast_clip_effect"].strip():
+        cfg["fast_clip_effect"] = "normal"
     cfg["language"] = normalize_language(cfg.get("language", "en"))
     return cfg
 
@@ -161,6 +184,13 @@ def save_config(cfg: dict, path: Optional[Path] = None) -> None:
     target = path or paths.config_path()
     out = dict(cfg)
     out["buffer_seconds"] = clamp_buffer_seconds(out.get("buffer_seconds", DEFAULT_BUFFER_SECONDS))
+    out["fast_clip_seconds"] = clamp_fast_clip_seconds(
+        out.get("fast_clip_seconds", DEFAULT_FAST_CLIP_SECONDS)
+    )
+    if not isinstance(out.get("fast_clip_hotkey"), str):
+        out["fast_clip_hotkey"] = DEFAULT_CONFIG["fast_clip_hotkey"]
+    if not isinstance(out.get("fast_clip_effect"), str) or not out["fast_clip_effect"].strip():
+        out["fast_clip_effect"] = "normal"
     out["language"] = normalize_language(out.get("language", "en"))
     _atomic_write_text(target, json.dumps(out, indent=2))
 

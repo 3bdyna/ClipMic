@@ -91,8 +91,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     from audio_buffer import MultiChannelCapture
     from hotkeys import (
         ClipEntry,
+        DEFAULT_FAST_CLIP_SECONDS,
         HotkeyManager,
         clamp_buffer_seconds,
+        clamp_fast_clip_seconds,
         load_clips,
         load_config,
         save_clips,
@@ -173,7 +175,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     logger.info("ClipMic starting (frozen=%s, data=%s)", paths.is_frozen(), paths.user_data_dir())
     clips = load_clips()
     buf_s = clamp_buffer_seconds(config.get("buffer_seconds", 30))
-    ring = MultiChannelCapture(duration_s=float(buf_s))
+    fast_s = clamp_fast_clip_seconds(config.get("fast_clip_seconds", DEFAULT_FAST_CLIP_SECONDS))
+    ring = MultiChannelCapture(duration_s=float(max(buf_s, fast_s)))
     injector = MicInjector()
     hotkeys = HotkeyManager()
 
@@ -203,6 +206,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         stop_hk = str(cfg.get("stop_hotkey", "") or "").strip()
         if stop_hk:
             bindings["__stop__"] = (stop_hk, lambda: win.stop_audio_requested.emit())
+        fast_hk = str(cfg.get("fast_clip_hotkey", "") or "").strip()
+        if fast_hk:
+            bindings["__fast_clip__"] = (fast_hk, lambda: win.fast_clip_requested.emit())
         for c in clip_list:
             if c.hotkey.strip():
                 cid = c.id

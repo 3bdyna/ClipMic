@@ -415,5 +415,91 @@ class TestPackagingAndI18nReadiness(unittest.TestCase):
                 self.assertIn(m.group(1), en_keys, f"Missing i18n key {m.group(1)} used in {pyf}")
 
 
+class TestFastClipCore(unittest.TestCase):
+    def test_detect_channel_kind_recognizes_known_games(self) -> None:
+        from audio_buffer import detect_channel_kind
+
+        for exe in ("overwatch.exe", "valorant-win64-shipping.exe", "cs2.exe"):
+            self.assertEqual(
+                detect_channel_kind(exe, exe_path=f"C:\\CustomFolder\\{exe}", check_modules=False),
+                "game",
+            )
+        self.assertEqual(
+            detect_channel_kind("discord.exe", exe_path="C:\\CustomFolder\\discord.exe", check_modules=False),
+            "app",
+        )
+
+    def test_snapshot_slice_seconds_trims_and_preserves_short(self) -> None:
+        from audio_buffer import CaptureSnapshot, ChannelClip
+
+        sr = 48000
+        peaks = np.zeros(0, dtype=np.float32)
+        long_audio = np.ones((sr * 10, 2), dtype=np.float32) * 0.25
+        short_audio = np.ones((sr * 2, 2), dtype=np.float32) * 0.5
+        snap = CaptureSnapshot(
+            sr,
+            [
+                ChannelClip("g1", "Game", "game", long_audio, sr, -12.0, -14.0, 50, peaks),
+                ChannelClip("a1", "App", "app", short_audio, sr, -6.0, -8.0, 100, peaks),
+            ],
+        )
+        sliced = snap.slice_seconds(4.0)
+        self.assertEqual(len(sliced.channel_by_key("g1").audio), sr * 4)
+        self.assertEqual(len(sliced.channel_by_key("a1").audio), sr * 2)
+
+    def test_choose_fast_clip_channels_priority(self) -> None:
+        from audio_buffer import ChannelClip, choose_fast_clip_channels
+
+        sr = 48000
+        silent = np.zeros((100, 2), dtype=np.float32)
+        peaks = np.zeros(0, dtype=np.float32)
+        ch_mic = ChannelClip("__mic__", "Mic", "mic", silent, sr, -5.0, -8.0, 10, peaks)
+        ch_sys = ChannelClip("__system__", "System", "app", silent, sr, -12.0, -15.0, 10, peaks)
+        ch_app_loud = ChannelClip("app1", "Chrome", "app", silent, sr, -6.0, -10.0, 100, peaks)
+        ch_game_quiet = ChannelClip("g1", "CS2", "game", silent, sr, -20.0, -25.0, 200, peaks)
+        ch_game_loud = ChannelClip("g2", "Valorant", "game", silent, sr, -10.0, -12.0, 100, peaks)
+
+        self.assertEqual(
+            choose_fast_clip_channels([ch_mic, ch_sys, ch_app_loud, ch_game_quiet, ch_game_loud]),
+            ["g2"],
+        )
+        self.assertEqual(
+            choose_fast_clip_channels([ch_mic, ch_sys, ch_app_loud]),
+            ["app1"],
+        )
+        ch_app_silent = ChannelClip("app_s", "IdleApp", "app", silent, sr, -70.0, -75.0, 100, peaks)
+        self.assertEqual(
+            choose_fast_clip_channels([ch_mic, ch_sys, ch_app_silent]),
+            ["__system__"],
+        )
+        self.assertEqual(choose_fast_clip_channels([ch_mic]), ["__mic__"])
+        self.assertEqual(choose_fast_clip_channels([]), [])
+
+    def test_fast_clip_config_roundtrip_and_clamping(self) -> None:
+        import hotkeys
+
+        self.assertEqual(hotkeys.clamp_fast_clip_seconds(0), hotkeys.MIN_FAST_CLIP_SECONDS)
+        self.assertEqual(hotkeys.clamp_fast_clip_seconds(999), hotkeys.MAX_FAST_CLIP_SECONDS)
+        self.assertEqual(hotkeys.clamp_fast_clip_seconds("bad"), hotkeys.DEFAULT_FAST_CLIP_SECONDS)
+        self.assertEqual(hotkeys.clamp_fast_clip_seconds(12), 12)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.json"
+            cfg_path.write_text('{"buffer_seconds": 30}', encoding="utf-8")
+            loaded = hotkeys.load_config(cfg_path)
+            self.assertEqual(loaded["fast_clip_hotkey"], "F8")
+            self.assertEqual(loaded["fast_clip_seconds"], hotkeys.DEFAULT_FAST_CLIP_SECONDS)
+            self.assertEqual(loaded["fast_clip_effect"], "normal")
+
+            loaded["fast_clip_hotkey"] = "Ctrl+F7"
+            loaded["fast_clip_seconds"] = 150
+            loaded["fast_clip_effect"] = "radio"
+            hotkeys.save_config(loaded, cfg_path)
+            reloaded = hotkeys.load_config(cfg_path)
+            self.assertEqual(reloaded["fast_clip_hotkey"], "Ctrl+F7")
+            self.assertEqual(reloaded["fast_clip_seconds"], hotkeys.MAX_FAST_CLIP_SECONDS)
+            self.assertEqual(reloaded["fast_clip_effect"], "radio")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

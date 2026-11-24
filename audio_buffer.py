@@ -999,6 +999,32 @@ _NON_GAME_EXES: set[str] = {
     "code", "devenv", "steamwebhelper", "steam", "epicgameslauncher", "riotclientservices",
 }
 
+_KNOWN_GAME_EXES: set[str] = {
+    "overwatch",
+    "valorant",
+    "valorant-win64-shipping",
+    "fortniteclient-win64-shipping",
+    "cs2",
+    "csgo",
+    "r5apex",
+    "league of legends",
+    "rocketleague",
+    "cod",
+    "rainbowsix",
+    "destiny2",
+    "dota2",
+    "eldenring",
+    "marvel-win64-shipping",
+    "pubg",
+    "tslgame",
+    "deadlock",
+    "helldivers2",
+    "rustclient",
+    "escapefromtarkov",
+    "bf2042",
+    "halo_infinite",
+}
+
 _GAME_PATH_MARKERS: tuple[str, ...] = (
     "\\steamapps\\",
     "\\epic games\\",
@@ -1116,6 +1142,8 @@ def detect_channel_kind(
         stem = Path(exe_path).stem.lower()
     if stem in _NON_GAME_EXES:
         return "app"
+    if stem in _KNOWN_GAME_EXES:
+        return "game"
 
     low_path = (exe_path or "").lower()
     if any(marker in low_path for marker in _GAME_PATH_MARKERS):
@@ -1644,6 +1672,31 @@ class CaptureSnapshot:
     def default_selected_keys(self) -> list[str]:
         return choose_default_channels(self.channels)
 
+    def fast_clip_selected_keys(self) -> list[str]:
+        return choose_fast_clip_channels(self.channels)
+
+    def slice_seconds(self, seconds: float) -> CaptureSnapshot:
+        """Return a new CaptureSnapshot containing at most the last `seconds` of each channel."""
+        target_frames = max(1, int(round(seconds * self.sample_rate))) if self.sample_rate > 0 else 1
+        sliced_channels: list[ChannelClip] = []
+        for ch in self.channels:
+            audio = ch.audio[-target_frames:].copy() if len(ch.audio) > target_frames else ch.audio.copy()
+            peak_db, rms_db = measure_channel_levels(audio, ch.sample_rate)
+            sliced_channels.append(
+                ChannelClip(
+                    key=ch.key,
+                    name=ch.name,
+                    kind=ch.kind,
+                    audio=audio,
+                    sample_rate=ch.sample_rate,
+                    peak_db=peak_db,
+                    rms_db=rms_db,
+                    ms_since_signal=ch.ms_since_signal,
+                    mini_peaks=_compute_mini_peaks(audio),
+                )
+            )
+        return CaptureSnapshot(self.sample_rate, sliced_channels)
+
     def mix(self, selected_keys: list[str]) -> tuple[np.ndarray, int]:
         by_key = {c.key: c.audio for c in self.channels}
         tracks = [by_key[k] for k in selected_keys if k in by_key]
@@ -1810,6 +1863,30 @@ def choose_default_channels(channels: list[ChannelClip]) -> list[str]:
         best = min(non_mic, key=_rank)
         return [best.key]
     return [channels[0].key]
+
+
+def choose_fast_clip_channels(channels: list[ChannelClip]) -> list[str]:
+    """Pick the single best channel for Fast Clip: active game > active app > system > default."""
+    if not channels:
+        return []
+    games = [c for c in channels if c.kind == "game"]
+    if games:
+        best = min(
+            games,
+            key=lambda c: (0 if 0 <= c.ms_since_signal <= 5000 else 1, -c.rms_db, -c.peak_db),
+        )
+        return [best.key]
+    apps = [
+        c
+        for c in channels
+        if c.kind == "app" and 0 <= c.ms_since_signal <= 5000 and c.rms_db > -60.0
+    ]
+    if apps:
+        best = min(apps, key=lambda c: (-c.rms_db, -c.peak_db))
+        return [best.key]
+    if any(c.key == "__system__" for c in channels):
+        return ["__system__"]
+    return choose_default_channels(channels)
 
 
 def _align_raw_tracks(

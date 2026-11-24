@@ -87,6 +87,12 @@ def clips_dir() -> Path:
     return d
 
 
+def clip_sources_dir() -> Path:
+    d = user_data_dir() / "clips" / "_sources"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def logs_dir() -> Path:
     d = user_data_dir() / "logs"
     d.mkdir(parents=True, exist_ok=True)

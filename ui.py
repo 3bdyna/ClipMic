@@ -40,7 +40,15 @@ from PySide6.QtWidgets import (
 )
 
 import paths
-from audio_buffer import CaptureSnapshot, ChannelClip, list_loopback_devices
+from audio_buffer import (
+    CaptureSnapshot,
+    ChannelClip,
+    delete_snapshot_bundle,
+    list_loopback_devices,
+    load_snapshot_bundle,
+    save_snapshot_bundle,
+    update_snapshot_selected_keys,
+)
 from effects import (
     DEFAULT_PARAMS,
     QUICK_PICK_IDS,
@@ -2317,6 +2325,11 @@ class TrimDialog(QDialog):
         default_name: Optional[str] = None,
         buffer_seconds: Optional[int] = None,
         import_name: Optional[str] = None,
+        initial_start: Optional[float] = None,
+        initial_end: Optional[float] = None,
+        initial_effect_id: Optional[str] = None,
+        has_raw_source: bool = False,
+        selected_keys: Optional[list[str]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -2332,6 +2345,8 @@ class TrimDialog(QDialog):
         self._existing = existing_clip
         self._on_change_channels = on_change_channels
         self._channel_count = int(channel_count)
+        self._has_raw_source = bool(has_raw_source)
+        self._selected_keys = list(selected_keys) if selected_keys else []
 
         self._tmp_dir = paths.temp_dir()
         self._created_temps: list[Path] = []
@@ -2397,6 +2412,14 @@ class TrimDialog(QDialog):
         self._waveform.playhead_scrubbed.connect(self._on_waveform_scrubbed)
         self._waveform.playhead_scrub_finished.connect(self._on_waveform_scrub_finished)
         self._waveform.set_audio(peaks, self._duration_s)
+        if self._has_raw_source:
+            start_val = 0.0 if initial_start is None else max(0.0, min(float(initial_start), max(0.0, self._duration_s - 0.1)))
+            if initial_end is None or float(initial_end) <= start_val:
+                start_val = 0.0
+                end_val = self._duration_s
+            else:
+                end_val = max(start_val + 0.1, min(float(initial_end), self._duration_s))
+            self._waveform.set_range(start_val, end_val)
         root.addWidget(self._waveform)
 
         # Voice Effect selector (clean dropdown + quick-picks + New / Manage)
@@ -2404,8 +2427,12 @@ class TrimDialog(QDialog):
         fx_hdr.setSpacing(8)
         fx_lbl = QLabel(t("trim.fx_section"))
         fx_lbl.setStyleSheet("color: #9CA3AF; font-size: 12px; font-weight: 600;")
+        self._reset_btn = QPushButton(t("trim.reset_original"))
+        self._reset_btn.setToolTip(t("trim.reset_original_tooltip"))
+        self._reset_btn.clicked.connect(self._on_reset_original)
         fx_hdr.addWidget(fx_lbl)
         fx_hdr.addStretch()
+        fx_hdr.addWidget(self._reset_btn)
         root.addLayout(fx_hdr)
 
         fx_sel_row = QHBoxLayout()
@@ -2434,8 +2461,9 @@ class TrimDialog(QDialog):
         self._preset_btns: dict[str, QPushButton] = {}
         root.addLayout(self._quick_row)
 
-        # When editing an already-processed WAV, default to "normal" to avoid double-applying effects.
-        self.reload_effects(select_id="normal")
+        # When editing a raw source, restore saved effect; otherwise default to "normal" to avoid double-applying.
+        init_fx = (initial_effect_id or "normal") if self._has_raw_source else "normal"
+        self.reload_effects(select_id=init_fx)
 
         # Playback actions
         play_row = QHBoxLayout()
@@ -2849,8 +2877,19 @@ class TrimDialog(QDialog):
         self._sync_play_button()
         self._status_lbl.setText(t("common.stopped"))
 
+    def _on_reset_original(self) -> None:
+        self._on_stop()
+        self._waveform.set_range(0.0, self._duration_s)
+        s, e = self._waveform.trim_range()
+        self._on_range_changed(s, e)
+        self.reload_effects(select_id="normal")
+        self._cache_key = None
+        self._rendered_wav = None
+        self._rendered_dur_s = None
+
     def _on_save(self) -> None:
         name = self._name_edit.text().strip() or t("trim.untitled_clip")
+        start_s, end_s = self._waveform.trim_range()
 
         def save_rendered(wav: Path) -> None:
             clips_root = paths.clips_dir()
@@ -2868,10 +2907,18 @@ class TrimDialog(QDialog):
 
             dur = probe_wav_duration(dest)
             fx_name = self._current_effect()["name"]
-            preset_label = (
-                self._existing.preset
-                if self._existing and self._current_effect_id == "normal"
-                else fx_name
+            if self._has_raw_source:
+                preset_label = fx_name
+            else:
+                preset_label = (
+                    self._existing.preset
+                    if self._existing and self._current_effect_id == "normal"
+                    else fx_name
+                )
+            sel_keys = (
+                list(self._selected_keys)
+                if self._selected_keys
+                else (list(self._existing.selected_keys) if self._existing else [])
             )
             entry = ClipEntry(
                 id=clip_id,
@@ -2880,6 +2927,11 @@ class TrimDialog(QDialog):
                 hotkey=self._hotkey_btn.hotkey(),
                 preset=preset_label,
                 duration=round(dur, 2),
+                source_dir=self._existing.source_dir if self._existing else "",
+                selected_keys=sel_keys,
+                trim_start=round(start_s, 3),
+                trim_end=round(end_s, 3),
+                effect_id=self._current_effect_id,
             )
             self.clip_saved.emit(entry)
             self.accept()
@@ -3245,6 +3297,7 @@ class MainWindow(QMainWindow):
         self._active_snapshot: Optional[CaptureSnapshot] = None
         self._active_selected_keys: list[str] = []
         self._active_capture_wav: Optional[Path] = None
+        self._editing_clip: Optional[ClipEntry] = None
         self._transitioning_session: bool = False
         self._toast_label: Optional[QLabel] = None
         self._tmp_capture_dir = paths.temp_dir()
@@ -4101,6 +4154,7 @@ class MainWindow(QMainWindow):
             on_change_channels=None,
             import_name=src_name,
             default_name=Path(src_name).stem,
+            has_raw_source=True,
         )
 
     @Slot(str, str)
@@ -4543,6 +4597,7 @@ class MainWindow(QMainWindow):
         snap = self._active_snapshot
         self._active_snapshot = None
         self._active_selected_keys = []
+        self._editing_clip = None
         if snap is not None:
             snap.release()
         self._unlink_capture_wav()
@@ -4570,7 +4625,7 @@ class MainWindow(QMainWindow):
         snap_wav = self._tmp_capture_dir / f"capture_{uuid.uuid4().hex[:8]}.wav"
         write_wav(snap_wav, audio, sr)
         self._active_capture_wav = snap_wav
-        self._open_trim_dialog(snap_wav, existing=None, buffer_seconds=secs)
+        self._open_trim_dialog(snap_wav, existing=None, buffer_seconds=secs, has_raw_source=True)
 
     def _open_channel_picker(self) -> None:
         snap = self._active_snapshot
@@ -4599,6 +4654,7 @@ class MainWindow(QMainWindow):
             snap = self._active_snapshot
             self._active_snapshot = None
             self._active_selected_keys = []
+            self._editing_clip = None
             if snap is not None:
                 snap.release()
             self._unlink_capture_wav()
@@ -4627,13 +4683,19 @@ class MainWindow(QMainWindow):
             self._active_picker = None
             if picker is not None:
                 picker.hide()
+            editing = self._editing_clip
             self._open_trim_dialog(
                 snap_wav,
-                existing=None,
+                existing=editing,
                 on_change_channels=self._return_to_channel_picker,
                 channel_summary=summary,
                 channel_count=len(self._active_selected_keys),
                 buffer_seconds=self._buffer_seconds(),
+                initial_start=editing.trim_start if editing else None,
+                initial_end=editing.trim_end if editing else None,
+                initial_effect_id=editing.effect_id if editing else None,
+                has_raw_source=True,
+                selected_keys=self._active_selected_keys,
             )
         finally:
             self._transitioning_session = False
@@ -4657,6 +4719,7 @@ class MainWindow(QMainWindow):
             snap = self._active_snapshot
             self._active_snapshot = None
             self._active_selected_keys = []
+            self._editing_clip = None
             if snap is not None:
                 snap.release()
             self._unlink_capture_wav()
@@ -4699,6 +4762,11 @@ class MainWindow(QMainWindow):
         default_name: Optional[str] = None,
         buffer_seconds: Optional[int] = None,
         import_name: Optional[str] = None,
+        initial_start: Optional[float] = None,
+        initial_end: Optional[float] = None,
+        initial_effect_id: Optional[str] = None,
+        has_raw_source: bool = False,
+        selected_keys: Optional[list[str]] = None,
     ) -> None:
         if self._active_popup is not None:
             self._active_popup.close()
@@ -4714,6 +4782,11 @@ class MainWindow(QMainWindow):
             default_name=default_name,
             buffer_seconds=buffer_seconds,
             import_name=import_name,
+            initial_start=initial_start,
+            initial_end=initial_end,
+            initial_effect_id=initial_effect_id,
+            has_raw_source=has_raw_source,
+            selected_keys=selected_keys,
             parent=self if self.isVisible() else None,
         )
         dlg.clip_saved.connect(self._on_clip_saved)
@@ -4725,6 +4798,30 @@ class MainWindow(QMainWindow):
         dlg.activateWindow()
 
     def _on_clip_saved(self, entry: ClipEntry) -> None:
+        if self._active_snapshot is not None:
+            src_dir = paths.clip_sources_dir() / entry.id
+            if (
+                (src_dir / "meta.json").is_file()
+                and self._editing_clip is not None
+                and self._editing_clip.id == entry.id
+            ):
+                update_snapshot_selected_keys(src_dir, list(self._active_selected_keys))
+            else:
+                save_snapshot_bundle(self._active_snapshot, src_dir, list(self._active_selected_keys))
+            entry.source_dir = f"clips/_sources/{entry.id}"
+            entry.selected_keys = list(self._active_selected_keys)
+        elif not entry.source_dir and self._editing_clip is None:
+            src_wav: Optional[Path] = None
+            if self._active_popup is not None and self._active_popup._source_wav.is_file():
+                src_wav = self._active_popup._source_wav
+            elif self._active_capture_wav is not None and self._active_capture_wav.is_file():
+                src_wav = self._active_capture_wav
+            if src_wav is not None:
+                src_dir = paths.clip_sources_dir() / entry.id
+                src_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_wav, src_dir / "original.wav")
+                entry.source_dir = f"clips/_sources/{entry.id}"
+
         replaced = False
         for i, existing in enumerate(self._clips):
             if existing.id == entry.id:
@@ -4737,11 +4834,79 @@ class MainWindow(QMainWindow):
         self._persist_and_bind()
 
     def _edit_clip(self, entry: ClipEntry) -> None:
+        src_dir = resolve_clip_path(entry.source_dir) if entry.source_dir else None
+        if src_dir is not None and (src_dir / "meta.json").is_file():
+            loaded = load_snapshot_bundle(src_dir)
+            if loaded is not None:
+                snap, saved_keys = loaded
+                self._release_capture_session()
+                self._editing_clip = entry
+                self._active_snapshot = snap
+                valid_keys = {c.key for c in snap.channels}
+                keys = [k for k in (entry.selected_keys or saved_keys) if k in valid_keys]
+                if not keys:
+                    keys = snap.default_selected_keys()
+                self._active_selected_keys = keys
+
+                mixed_i16, sr = snap.mix(self._active_selected_keys)
+                if mixed_i16.size > 0:
+                    snap_wav = self._tmp_capture_dir / f"capture_{uuid.uuid4().hex[:8]}.wav"
+                    write_wav(snap_wav, mixed_i16, sr)
+                    self._active_capture_wav = snap_wav
+                    names = [c.name for c in snap.channels if c.key in set(self._active_selected_keys)]
+                    summary = " + ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
+                    self._open_trim_dialog(
+                        snap_wav,
+                        existing=entry,
+                        on_change_channels=self._return_to_channel_picker,
+                        channel_summary=summary,
+                        channel_count=len(self._active_selected_keys),
+                        initial_start=entry.trim_start,
+                        initial_end=entry.trim_end,
+                        initial_effect_id=entry.effect_id,
+                        has_raw_source=True,
+                        selected_keys=self._active_selected_keys,
+                    )
+                    return
+
+        if src_dir is not None and (src_dir / "original.wav").is_file():
+            self._release_capture_session()
+            self._editing_clip = entry
+            self._open_trim_dialog(
+                src_dir / "original.wav",
+                existing=entry,
+                initial_start=entry.trim_start,
+                initial_end=entry.trim_end,
+                initial_effect_id=entry.effect_id,
+                has_raw_source=True,
+            )
+            return
+
         wav_path = resolve_clip_path(entry.file)
         if not wav_path.is_file():
             QMessageBox.warning(self, t("main.err_missing_file_title"), t("main.err_missing_file_body", path=wav_path))
             return
-        self._open_trim_dialog(wav_path, existing=entry)
+        self._release_capture_session()
+        self._editing_clip = entry
+        self._open_trim_dialog(wav_path, existing=entry, has_raw_source=False)
+
+    def _change_clip_source(self, entry: ClipEntry) -> None:
+        src_dir = resolve_clip_path(entry.source_dir) if entry.source_dir else None
+        if src_dir is None or not (src_dir / "meta.json").is_file():
+            return
+        loaded = load_snapshot_bundle(src_dir)
+        if loaded is None:
+            return
+        snap, saved_keys = loaded
+        self._release_capture_session()
+        self._editing_clip = entry
+        self._active_snapshot = snap
+        valid_keys = {c.key for c in snap.channels}
+        keys = [k for k in (entry.selected_keys or saved_keys) if k in valid_keys]
+        if not keys:
+            keys = snap.default_selected_keys()
+        self._active_selected_keys = keys
+        self._open_channel_picker()
 
     def _default_export_dir(self) -> Path:
         if self._last_export_dir is not None and self._last_export_dir.is_dir():
@@ -4798,6 +4963,8 @@ class MainWindow(QMainWindow):
         preview_act = menu.addAction(t("main.ctx_preview"))
         play_act = menu.addAction(t("main.ctx_play"))
         edit_act = menu.addAction(t("main.ctx_edit"))
+        has_bundle = bool(entry.source_dir and (resolve_clip_path(entry.source_dir) / "meta.json").is_file())
+        change_src_act = menu.addAction(t("clip.change_source")) if has_bundle else None
         export_act = menu.addAction(t("main.ctx_export"))
         menu.addSeparator()
         del_act = menu.addAction(t("main.ctx_delete"))
@@ -4809,6 +4976,8 @@ class MainWindow(QMainWindow):
             self.play_clip_by_id(entry.id)
         elif chosen is edit_act:
             self._edit_clip(entry)
+        elif change_src_act is not None and chosen is change_src_act:
+            self._change_clip_source(entry)
         elif chosen is export_act:
             self._export_clip_mp3(entry)
         elif chosen is del_act:
@@ -4824,6 +4993,7 @@ class MainWindow(QMainWindow):
                 wav_path.unlink()
             except OSError:
                 pass
+        delete_snapshot_bundle(paths.clip_sources_dir() / entry.id)
         self._rebuild_clip_list()
         self._persist_and_bind()
 

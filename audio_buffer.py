@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+import json
 import logging
 import os
+import shutil
 import threading
 import time
+import uuid
+import wave
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -1650,6 +1654,143 @@ class CaptureSnapshot:
             ch.audio = np.zeros((0, CAPTURE_CHANNELS), dtype=np.float32)
             ch.mini_peaks = np.zeros(0, dtype=np.float32)
         self.channels.clear()
+
+
+def save_snapshot_bundle(snapshot: CaptureSnapshot, dest_dir: Path, selected_keys: list[str]) -> None:
+    """Persist a CaptureSnapshot's raw tracks and metadata to dest_dir."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    sr = int(snapshot.sample_rate)
+    channels_meta: list[dict] = []
+    for i, ch in enumerate(snapshot.channels):
+        fname = f"ch_{i}.wav"
+        arr = np.asarray(ch.audio, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = np.column_stack((arr, arr))
+        elif arr.shape[1] == 1:
+            arr = np.repeat(arr, 2, axis=1)
+        elif arr.shape[1] > 2:
+            arr = arr[:, :2]
+        clamped = np.clip(arr, -1.0, 1.0)
+        pcm = np.round(clamped * 32767.0).astype(np.int16)
+        with wave.open(str(dest_dir / fname), "wb") as wf:
+            wf.setnchannels(2)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(pcm.tobytes())
+        channels_meta.append(
+            {
+                "key": str(ch.key),
+                "name": str(ch.name),
+                "kind": str(ch.kind),
+                "file": fname,
+                "peak_db": float(ch.peak_db),
+                "rms_db": float(ch.rms_db),
+                "ms_since_signal": int(ch.ms_since_signal),
+            }
+        )
+
+    meta = {
+        "version": 1,
+        "sample_rate": sr,
+        "selected_keys": [str(k) for k in selected_keys],
+        "channels": channels_meta,
+    }
+    meta_path = dest_dir / "meta.json"
+    tmp_path = dest_dir / f"meta.{uuid.uuid4().hex[:6]}.tmp"
+    try:
+        tmp_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        os.replace(tmp_path, meta_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def load_snapshot_bundle(src_dir: Path) -> Optional[tuple[CaptureSnapshot, list[str]]]:
+    """Load a persisted CaptureSnapshot bundle from src_dir, or None if missing/corrupt."""
+    meta_path = src_dir / "meta.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict) or int(meta.get("version", 0)) != 1:
+            return None
+        sr = int(meta["sample_rate"])
+        raw_channels = meta.get("channels")
+        if not isinstance(raw_channels, list) or sr <= 0:
+            return None
+        raw_selected = meta.get("selected_keys", [])
+        selected_keys = [str(k) for k in raw_selected] if isinstance(raw_selected, list) else []
+
+        channels: list[ChannelClip] = []
+        for item in raw_channels:
+            if not isinstance(item, dict):
+                return None
+            wav_path = src_dir / str(item["file"])
+            if not wav_path.is_file():
+                return None
+            with wave.open(str(wav_path), "rb") as wf:
+                n_ch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                frames = wf.readframes(wf.getnframes())
+            if sw != 2 or n_ch < 1:
+                return None
+            pcm = np.frombuffer(frames, dtype=np.int16)
+            if n_ch == 1:
+                pcm = np.column_stack((pcm, pcm))
+            else:
+                pcm = pcm.reshape(-1, n_ch)[:, :2]
+            audio_f32 = pcm.astype(np.float32) / 32768.0
+            channels.append(
+                ChannelClip(
+                    key=str(item["key"]),
+                    name=str(item["name"]),
+                    kind=str(item["kind"]),
+                    audio=audio_f32,
+                    sample_rate=sr,
+                    peak_db=float(item.get("peak_db", -96.0)),
+                    rms_db=float(item.get("rms_db", -96.0)),
+                    ms_since_signal=int(item.get("ms_since_signal", -1)),
+                    mini_peaks=_compute_mini_peaks(audio_f32),
+                )
+            )
+        return CaptureSnapshot(sr, channels), selected_keys
+    except Exception as exc:
+        _log.warning("Failed to load snapshot bundle from %s: %s", src_dir, exc)
+        return None
+
+
+def delete_snapshot_bundle(src_dir: Path) -> None:
+    """Safely remove a persisted snapshot bundle directory."""
+    shutil.rmtree(src_dir, ignore_errors=True)
+
+
+def update_snapshot_selected_keys(src_dir: Path, selected_keys: list[str]) -> bool:
+    """Update only selected_keys in src_dir/meta.json atomically without rewriting WAVs."""
+    meta_path = src_dir / "meta.json"
+    if not meta_path.is_file():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            return False
+        meta["selected_keys"] = [str(k) for k in selected_keys]
+        tmp_path = src_dir / f"meta.{uuid.uuid4().hex[:6]}.tmp"
+        try:
+            tmp_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            os.replace(tmp_path, meta_path)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+        return True
+    except Exception as exc:
+        _log.warning("Failed to update selected_keys in %s: %s", src_dir, exc)
+        return False
 
 
 def choose_default_channels(channels: list[ChannelClip]) -> list[str]:

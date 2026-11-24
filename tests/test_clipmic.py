@@ -161,6 +161,51 @@ class TestTrimDialogPreviewUI(unittest.TestCase):
                 dlg.close()
                 inj.close()
 
+    def test_trim_dialog_reset_to_original(self) -> None:
+        import ui
+
+        inj = mic_inject.MicInjector()
+        non_normal = [fx["id"] for fx in effects.load_effects() if fx["id"] != "normal"]
+        target_fx = non_normal[0] if non_normal else "normal"
+        with tempfile.TemporaryDirectory() as td:
+            wav = Path(td) / "orig.wav"
+            dur_s = 2.0
+            effects.write_wav(wav, np.zeros((int(48000 * dur_s), 2), dtype=np.int16), 48000)
+
+            dlg = ui.TrimDialog(
+                wav,
+                inj,
+                lambda: (True, 0.0, 0.0),
+                initial_start=0.4,
+                initial_end=1.3,
+                initial_effect_id=target_fx,
+                has_raw_source=True,
+            )
+            try:
+                s0, e0 = dlg._waveform.trim_range()
+                self.assertAlmostEqual(s0, 0.4, places=2)
+                self.assertAlmostEqual(e0, 1.3, places=2)
+                self.assertEqual(dlg._current_effect_id, target_fx)
+
+                dlg._cache_key = dlg._current_key()
+                dlg._rendered_wav = wav
+                dlg._rendered_dur_s = 0.9
+                before_lbl = dlg._range_lbl.text()
+
+                dlg._on_reset_original()
+                s1, e1 = dlg._waveform.trim_range()
+                self.assertAlmostEqual(s1, 0.0, places=3)
+                self.assertAlmostEqual(e1, dlg._duration_s, places=3)
+                self.assertEqual(dlg._current_effect_id, "normal")
+                self.assertIsNone(dlg._cache_key)
+                self.assertIsNone(dlg._rendered_wav)
+                self.assertIsNone(dlg._rendered_dur_s)
+                self.assertNotEqual(dlg._range_lbl.text(), before_lbl)
+                self.assertIn("2.00", dlg._range_lbl.text())
+            finally:
+                dlg.close()
+                inj.close()
+
 
 class TestEffectsAndAudioCore(unittest.TestCase):
     def test_probe_wav_duration_reads_header_accurately(self) -> None:
@@ -218,6 +263,115 @@ class TestEffectsAndAudioCore(unittest.TestCase):
         self.assertEqual(mixed.dtype, np.int16)
         self.assertLess(int(mixed.max()), 32767)
         self.assertGreater(int(mixed.max()), 27000)
+
+    def test_snapshot_bundle_roundtrip_and_delete(self) -> None:
+        sr = 48000
+        a1 = np.full((4800, 2), 0.25, dtype=np.float32)
+        a2 = np.full((4800, 2), -0.5, dtype=np.float32)
+        ch1 = audio_buffer.ChannelClip(
+            key="game:1",
+            name="Game",
+            kind="game",
+            audio=a1,
+            sample_rate=sr,
+            peak_db=-12.0,
+            rms_db=-14.0,
+            ms_since_signal=50,
+            mini_peaks=audio_buffer._compute_mini_peaks(a1),
+        )
+        ch2 = audio_buffer.ChannelClip(
+            key="mic:default",
+            name="Mic",
+            kind="mic",
+            audio=a2,
+            sample_rate=sr,
+            peak_db=-6.0,
+            rms_db=-8.0,
+            ms_since_signal=10,
+            mini_peaks=audio_buffer._compute_mini_peaks(a2),
+        )
+        snap = audio_buffer.CaptureSnapshot(sr, [ch1, ch2])
+        with tempfile.TemporaryDirectory() as td:
+            bundle_dir = Path(td) / "bundle_abc"
+            audio_buffer.save_snapshot_bundle(snap, bundle_dir, ["game:1"])
+            self.assertTrue((bundle_dir / "meta.json").is_file())
+
+            loaded = audio_buffer.load_snapshot_bundle(bundle_dir)
+            self.assertIsNotNone(loaded)
+            loaded_snap, loaded_keys = loaded  # type: ignore[misc]
+            self.assertEqual(loaded_snap.sample_rate, sr)
+            self.assertEqual(loaded_keys, ["game:1"])
+            self.assertEqual(len(loaded_snap.channels), 2)
+            self.assertEqual(loaded_snap.channels[0].key, "game:1")
+            self.assertEqual(loaded_snap.channels[1].kind, "mic")
+            self.assertEqual(loaded_snap.channels[0].audio.shape, (4800, 2))
+            self.assertTrue(np.allclose(loaded_snap.channels[0].audio, a1, atol=1e-3))
+            self.assertTrue(np.allclose(loaded_snap.channels[1].audio, a2, atol=1e-3))
+            self.assertEqual(len(loaded_snap.channels[0].mini_peaks), 120)
+
+            ch0_path = bundle_dir / "ch_0.wav"
+            ch0_bytes_before = ch0_path.read_bytes()
+            ch0_mtime_before = ch0_path.stat().st_mtime_ns
+            self.assertTrue(audio_buffer.update_snapshot_selected_keys(bundle_dir, ["game:1", "mic:default"]))
+            self.assertEqual(ch0_path.read_bytes(), ch0_bytes_before)
+            self.assertEqual(ch0_path.stat().st_mtime_ns, ch0_mtime_before)
+            loaded2 = audio_buffer.load_snapshot_bundle(bundle_dir)
+            self.assertIsNotNone(loaded2)
+            self.assertEqual(loaded2[1], ["game:1", "mic:default"])  # type: ignore[index]
+
+            audio_buffer.delete_snapshot_bundle(bundle_dir)
+            self.assertFalse(bundle_dir.exists())
+            self.assertIsNone(audio_buffer.load_snapshot_bundle(bundle_dir))
+            self.assertFalse(audio_buffer.update_snapshot_selected_keys(bundle_dir, ["game:1"]))
+
+    def test_clip_entry_backward_compat_and_roundtrip(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as td:
+            clips_file = Path(td) / "clips.json"
+            legacy_payload = [
+                {
+                    "id": "old123",
+                    "name": "Legacy Clip",
+                    "file": "clips/legacy.wav",
+                    "hotkey": "Ctrl+1",
+                    "preset": "Radio",
+                    "duration": 1.25,
+                }
+            ]
+            clips_file.write_text(json.dumps(legacy_payload), encoding="utf-8")
+            loaded = hotkeys.load_clips(clips_file)
+            self.assertEqual(len(loaded), 1)
+            c = loaded[0]
+            self.assertEqual(c.id, "old123")
+            self.assertEqual(c.source_dir, "")
+            self.assertEqual(c.selected_keys, [])
+            self.assertEqual(c.trim_start, 0.0)
+            self.assertEqual(c.trim_end, 0.0)
+            self.assertEqual(c.effect_id, "normal")
+
+            updated = hotkeys.ClipEntry(
+                id="new456",
+                name="Editable Clip",
+                file="clips/new.wav",
+                hotkey="F8",
+                preset="Radio",
+                duration=2.5,
+                source_dir="clips/_sources/new456",
+                selected_keys=["game:1", "mic:default"],
+                trim_start=0.5,
+                trim_end=3.0,
+                effect_id="radio",
+            )
+            hotkeys.save_clips([c, updated], clips_file)
+            reloaded = hotkeys.load_clips(clips_file)
+            self.assertEqual(len(reloaded), 2)
+            r = reloaded[1]
+            self.assertEqual(r.source_dir, "clips/_sources/new456")
+            self.assertEqual(r.selected_keys, ["game:1", "mic:default"])
+            self.assertAlmostEqual(r.trim_start, 0.5)
+            self.assertAlmostEqual(r.trim_end, 3.0)
+            self.assertEqual(r.effect_id, "radio")
 
 
 class TestPackagingAndI18nReadiness(unittest.TestCase):

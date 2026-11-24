@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -111,6 +111,11 @@ class ClipEntry:
     hotkey: str = ""
     preset: str = "Normal"
     duration: float = 0.0
+    source_dir: str = ""
+    selected_keys: list[str] = field(default_factory=list)
+    trim_start: float = 0.0
+    trim_end: float = 0.0
+    effect_id: str = "normal"
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -178,6 +183,16 @@ def load_clips(path: Optional[Path] = None) -> list[ClipEntry]:
                 dur = float(item.get("duration", 0.0))
             except (TypeError, ValueError):
                 dur = 0.0
+            try:
+                trim_start = float(item.get("trim_start", 0.0))
+            except (TypeError, ValueError):
+                trim_start = 0.0
+            try:
+                trim_end = float(item.get("trim_end", 0.0))
+            except (TypeError, ValueError):
+                trim_end = 0.0
+            raw_keys = item.get("selected_keys", [])
+            selected_keys = [str(k) for k in raw_keys] if isinstance(raw_keys, list) else []
             clips.append(
                 ClipEntry(
                     id=str(item.get("id") or uuid.uuid4().hex[:8]),
@@ -186,6 +201,11 @@ def load_clips(path: Optional[Path] = None) -> list[ClipEntry]:
                     hotkey=str(item.get("hotkey", "") or ""),
                     preset=str(item.get("preset", "Normal") or "Normal"),
                     duration=dur,
+                    source_dir=str(item.get("source_dir", "") or ""),
+                    selected_keys=selected_keys,
+                    trim_start=trim_start,
+                    trim_end=trim_end,
+                    effect_id=str(item.get("effect_id", "normal") or "normal"),
                 )
             )
         return clips

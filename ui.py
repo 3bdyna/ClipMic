@@ -145,22 +145,42 @@ QPushButton#Primary:hover {
     border-color: #E2E2E6;
 }
 QPushButton#Accent {
-    background-color: #2B4236;
-    border-color: #3D5E4C;
-    color: #E6F2EC;
+    background-color: #18231F;
+    border-color: #2A4037;
+    color: #89C2A4;
 }
 QPushButton#Accent:hover {
-    background-color: #365243;
-    border-color: #4E7560;
+    background-color: #1F2E28;
+    border-color: #3A594C;
+    color: #A3D4BA;
 }
 QPushButton#Danger {
-    background-color: #2E1B1B;
-    border-color: #543131;
-    color: #E2A3A3;
+    background-color: #251B1D;
+    border-color: #462D32;
+    color: #D48E95;
 }
 QPushButton#Danger:hover {
-    background-color: #4A2525;
-    color: #F5E6E6;
+    background-color: #302124;
+    border-color: #5C3A41;
+    color: #E2A8AE;
+}
+QPushButton#ExportCard {
+    background-color: #141417;
+    color: #C8C8D0;
+    border: 1px solid #22222A;
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QPushButton#ExportCard:hover {
+    background-color: #1C1C22;
+    border-color: #343440;
+    color: #F2F2F4;
+}
+QPushButton#ExportCard:pressed {
+    background-color: #111115;
+    border-color: #2A2A34;
 }
 QMenu {
     background-color: #141417;
@@ -190,9 +210,9 @@ QPushButton#PresetBtn {
     color: #D4D4D8;
 }
 QPushButton#PresetBtn:checked {
-    background-color: #2B4236;
-    border: 1px solid #5D9173;
-    color: #E6F2EC;
+    background-color: #18231F;
+    border: 1px solid #2A4037;
+    color: #89C2A4;
     font-weight: 700;
 }
 QPushButton#ChangeChannelsBtn {
@@ -225,9 +245,9 @@ QPushButton#BufPresetBtn:hover {
     color: #F4F4F5;
 }
 QPushButton#BufPresetBtn:checked {
-    background-color: #2B4236;
-    border-color: #4E7560;
-    color: #E6F2EC;
+    background-color: #18231F;
+    border-color: #2A4037;
+    color: #89C2A4;
 }
 QFrame#DropZone {
     background-color: #111115;
@@ -321,8 +341,8 @@ class _ClipMicStyle(QProxyStyle):
                 fill = QColor("#151518")
                 border = QColor("#25252C")
             elif checked:
-                fill = QColor("#2B4236")
-                border = QColor("#6EA685" if hovered else "#558A6C")
+                fill = QColor("#18231F")
+                border = QColor("#66A686" if hovered else "#2A4037")
             else:
                 fill = QColor("#1C1C22" if hovered else "#161619")
                 border = QColor("#565666" if hovered else "#3A3A44")
@@ -332,7 +352,7 @@ class _ClipMicStyle(QProxyStyle):
             painter.drawRoundedRect(rect, 4.0, 4.0)
 
             if checked:
-                ck_pen = QPen(QColor("#E6F2EC" if enabled else "#6B7280"), 1.8)
+                ck_pen = QPen(QColor("#89C2A4" if enabled else "#6B7280"), 1.8)
                 ck_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
                 ck_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
                 painter.setPen(ck_pen)
@@ -579,7 +599,7 @@ class WaveformWidget(QWidget):
     _BAR_DIM = QColor("#3A3A44")
     _BAR_LIT = QColor("#E4E4E7")
     _SEL_FILL = QColor(244, 244, 245, 22)
-    _START_COLOR = QColor("#7FA68A")
+    _START_COLOR = QColor("#66A686")
     _END_COLOR = QColor("#C2A878")
     _START_PEN = QPen(_START_COLOR, 2)
     _END_PEN = QPen(_END_COLOR, 2)
@@ -1141,6 +1161,7 @@ class EffectBuilderDialog(QDialog):
         root.addLayout(btn_row)
 
         self._play_seq = 0
+        self._preview_cancelled = False
         self.playback_done.connect(self._on_playback_done)
 
     def _on_playback_done(self, seq: int) -> None:
@@ -1199,6 +1220,7 @@ class EffectBuilderDialog(QDialog):
     def _on_preview(self) -> None:
         if self._worker_thread and self._worker_thread.isRunning():
             return
+        self._preview_cancelled = False
         self._injector.stop()
         src, start_s, end_s = self._get_preview_source()
         out_wav = self._tmp_dir / f"fx_prev_{uuid.uuid4().hex[:8]}.wav"
@@ -1234,6 +1256,9 @@ class EffectBuilderDialog(QDialog):
         self._worker = None
         self._preview_btn.setDisabled(False)
         self._save_btn.setDisabled(False)
+        if self._preview_cancelled:
+            self._preview_cancelled = False
+            return
         if err:
             self._status_lbl.setText("")
             QMessageBox.warning(self, t("builder.err_preview_title"), err)
@@ -1251,6 +1276,7 @@ class EffectBuilderDialog(QDialog):
         )
 
     def _on_stop(self) -> None:
+        self._preview_cancelled = True
         self._play_seq += 1
         self._injector.stop()
         self._status_lbl.setText(t("common.stopped"))
@@ -1417,7 +1443,7 @@ class ManageEffectsDialog(QDialog):
                 if fx["id"] == "normal"
                 else (t("manage_fx.tag_builtin") if fx.get("builtin") else t("manage_fx.tag_custom"))
             )
-            tag_col = "#71717A" if fx.get("builtin") else "#9FC5AA"
+            tag_col = "#71717A" if fx.get("builtin") else "#89C2A4"
             tag_lbl = QLabel(tag_txt)
             tag_lbl.setStyleSheet(
                 f"color: {tag_col}; background: #1B1B20; border: 1px solid #2A2A32; "
@@ -1703,7 +1729,7 @@ class ChannelPickerDialog(QDialog):
     preview_done = Signal(int)
 
     _BADGE_STYLES: dict[str, tuple[str, str]] = {
-        "game": ("picker.badge_game", "background: #1E2E24; color: #9FC5AA; border: 1px solid #2F4A38;"),
+        "game": ("picker.badge_game", "background: #18231F; color: #89C2A4; border: 1px solid #2A4037;"),
         "app": ("picker.badge_app", "background: #1C1C22; color: #A1A1AA; border: 1px solid #2D2D36;"),
         "mic": ("picker.badge_mic", "background: #2E2417; color: #E2C08D; border: 1px solid #4F3D24;"),
         "system": ("picker.badge_system", "background: #172554; color: #93C5FD; border: 1px solid #1E3A8A;"),
@@ -2195,6 +2221,7 @@ class TrimDialog(QDialog):
         self._play_end_s = 0.0
         self._play_dur_s = 0.0
         self._play_seq = 0
+        self._is_playing = False
         self._is_preview_playing = False
         self._scrub_was_playing = False
         self._last_scrub_seek_ts = 0.0
@@ -2425,6 +2452,7 @@ class TrimDialog(QDialog):
     def _on_playback_done(self, seq: int) -> None:
         if seq != self._play_seq:
             return
+        self._is_playing = False
         self._is_preview_playing = False
         self._stop_playhead()
         self._status_lbl.setText("")
@@ -2436,6 +2464,7 @@ class TrimDialog(QDialog):
             offset = self._map_waveform_sec_to_rendered_offset(target_sec, dur)
             self._play_seq += 1
             seq = self._play_seq
+            self._is_playing = True
             self._is_preview_playing = True
             self._status_lbl.setText(t("trim.status_playing"))
             self._start_playhead(wav, offset_s=offset, start_timer=start_timer)
@@ -2476,6 +2505,7 @@ class TrimDialog(QDialog):
             mode = t("trim.status_sending") if self._injector.apo_installed else t("trim.status_speaker_mode")
             self._play_seq += 1
             seq = self._play_seq
+            self._is_playing = True
             self._is_preview_playing = False
             self._status_lbl.setText(mode)
             self._start_playhead(wav)
@@ -2492,6 +2522,9 @@ class TrimDialog(QDialog):
 
     def _on_stop(self) -> None:
         self._play_seq += 1
+        self._pending_then = None
+        self._pending_key = None
+        self._is_playing = False
         self._is_preview_playing = False
         self._scrub_was_playing = False
         self._injector.stop()
@@ -2777,7 +2810,7 @@ class MainWindow(QMainWindow):
     capture_requested = Signal()
     play_clip_requested = Signal(str)
     stop_audio_requested = Signal()
-    clip_playback_done = Signal()
+    clip_playback_done = Signal(int)
     loopback_status_changed = Signal(str, str)
     buffer_duration_changed = Signal(int)
     language_changed = Signal(str)
@@ -2819,6 +2852,14 @@ class MainWindow(QMainWindow):
         self._apo_worker: Optional[_ApoProcessWorker] = None
         self._devices_scanned: bool = False
         self._default_mic_name: Optional[str] = None
+        self._clip_play_seq: int = 0
+        self._playing_clip_id: Optional[str] = None
+        self._playing_clip_mode: Optional[str] = None  # "mic" or "preview"
+        self._clip_row_buttons: dict[str, tuple[QPushButton, QPushButton]] = {}
+        self._status_override_until: float = 0.0
+        self._status_restore_timer = QTimer(self)
+        self._status_restore_timer.setSingleShot(True)
+        self._status_restore_timer.timeout.connect(self._on_status_override_expired)
         self._tray_trim_timer = QTimer(self)
         self._tray_trim_timer.setSingleShot(True)
         self._tray_trim_timer.setInterval(250)
@@ -3356,6 +3397,7 @@ class MainWindow(QMainWindow):
 
     def shutdown(self) -> None:
         """Stop timers, background scan/decode threads, and any open capture/trim popups cleanly."""
+        self._status_restore_timer.stop()
         self._tray_trim_timer.stop()
         self._session_timer.stop()
         if self._toast_label is not None:
@@ -3533,11 +3575,54 @@ class MainWindow(QMainWindow):
         self._refresh_status()
         self._refresh_listening()
 
-    def stop_all_audio(self) -> None:
-        picker_playing = bool(self._active_picker is not None and getattr(self._active_picker, "_playing_key", None))
-        popup_playing = bool(self._active_popup is not None and getattr(self._active_popup, "_is_preview_playing", False))
-        was_playing = self._injector.stop_all() or picker_playing or popup_playing
-        self._on_clip_playback_done()
+    def _set_status_message(self, message: str, *, hold_ms: int = 3500, is_error: bool = False) -> None:
+        """Display a transient status bar message protected from background _refresh_status() overwrites."""
+        self._status_override_until = time.monotonic() + max(0.0, hold_ms / 1000.0)
+        color = "#D48E95" if is_error else "#D4D4D8"
+        self._status_bar_lbl.setStyleSheet(
+            f"color: {color}; font-size: 11px; padding-top: 2px; border-top: 1px solid #1E1E24;"
+        )
+        self._status_bar_lbl.setText(message)
+        if hold_ms > 0:
+            self._status_restore_timer.start(hold_ms)
+        else:
+            self._status_restore_timer.stop()
+
+    def _on_status_override_expired(self) -> None:
+        if time.monotonic() < self._status_override_until - 0.01:
+            return
+        self._status_override_until = 0.0
+        self._status_bar_lbl.setStyleSheet(
+            "color: #8B8B96; font-size: 11px; padding-top: 2px; border-top: 1px solid #1E1E24;"
+        )
+        self._refresh_status()
+
+    def _repolish_widget(self, w: QWidget) -> None:
+        w.style().unpolish(w)
+        w.style().polish(w)
+
+    def _sync_clip_playback_buttons(self) -> None:
+        """Reflect the currently active saved-clip playback state on row buttons and top Stop button."""
+        active_id = self._playing_clip_id
+        active_mode = self._playing_clip_mode
+        for cid, (prev_btn, mic_btn) in list(self._clip_row_buttons.items()):
+            try:
+                is_prev = cid == active_id and active_mode == "preview"
+                is_mic = cid == active_id and active_mode == "mic"
+                prev_btn.setText(t("common.stop") if is_prev else t("main.clip_preview_btn"))
+                prev_btn.setObjectName("Danger" if is_prev else "")
+                self._repolish_widget(prev_btn)
+
+                mic_btn.setText(t("common.stop") if is_mic else t("main.clip_play_btn"))
+                mic_btn.setObjectName("Danger" if is_mic else "Accent")
+                self._repolish_widget(mic_btn)
+            except RuntimeError:
+                self._clip_row_buttons.pop(cid, None)
+
+        self._stop_btn.setObjectName("Danger" if active_id is not None else "")
+        self._repolish_widget(self._stop_btn)
+
+    def _stop_other_dialog_playback(self) -> None:
         if self._active_picker is not None:
             try:
                 self._active_picker.stop_preview()
@@ -3548,12 +3633,43 @@ class MainWindow(QMainWindow):
                 self._active_popup._on_stop()
             except Exception:
                 pass
-        self._status_bar_lbl.setText(t("main.status_audio_stopped") if was_playing else t("main.status_nothing_playing"))
 
-    def _on_clip_playback_done(self) -> None:
-        self._stop_btn.setObjectName("")
-        self._stop_btn.style().unpolish(self._stop_btn)
-        self._stop_btn.style().polish(self._stop_btn)
+    def stop_all_audio(self, _checked: bool = False) -> None:
+        clip_playing = self._playing_clip_id is not None
+        picker_playing = bool(self._active_picker is not None and getattr(self._active_picker, "_playing_key", None))
+        popup_playing = bool(
+            self._active_popup is not None
+            and (
+                getattr(self._active_popup, "_is_playing", False)
+                or getattr(self._active_popup, "_is_preview_playing", False)
+                or getattr(self._active_popup, "_pending_then", None) is not None
+            )
+        )
+        was_playing = self._injector.stop_all() or clip_playing or picker_playing or popup_playing
+        self._clip_play_seq += 1
+        self._playing_clip_id = None
+        self._playing_clip_mode = None
+        self._sync_clip_playback_buttons()
+        self._stop_other_dialog_playback()
+        self._set_status_message(
+            t("main.status_audio_stopped") if was_playing else t("main.status_nothing_playing"),
+            hold_ms=3500,
+            is_error=False,
+        )
+
+    @Slot(int)
+    def _on_clip_playback_done(self, seq: int) -> None:
+        if seq != self._clip_play_seq:
+            return
+        self._playing_clip_id = None
+        self._playing_clip_mode = None
+        self._sync_clip_playback_buttons()
+        self._status_override_until = 0.0
+        self._status_restore_timer.stop()
+        self._status_bar_lbl.setStyleSheet(
+            "color: #8B8B96; font-size: 11px; padding-top: 2px; border-top: 1px solid #1E1E24;"
+        )
+        self._refresh_status()
 
     def _on_startup_toggled(self, checked: bool) -> None:
         try:
@@ -3600,7 +3716,7 @@ class MainWindow(QMainWindow):
             return
         if not self._ring.is_running:
             self._listening_label.setText(t("main.listening_stopped"))
-            self._listening_label.setStyleSheet("color: #F87171; font-size: 12px;")
+            self._listening_label.setStyleSheet("color: #D48E95; font-size: 12px;")
             return
         apps = self._ring.refresh_active_sessions()
         raw_dev = (self._ring.device_name or "").replace(" [Loopback]", "")
@@ -3619,7 +3735,7 @@ class MainWindow(QMainWindow):
 
         active_now = self._ring.is_receiving_audio()
         dot = "●" if active_now else "○"
-        color = "#34D399" if active_now else "#9CA3AF"
+        color = "#89C2A4" if active_now else "#9CA3AF"
         apps_txt = ", ".join(visible_apps[:5]) if visible_apps else t("main.listening_waiting")
         secs = self._buffer_seconds()
         mic_tag = (
@@ -3656,7 +3772,7 @@ class MainWindow(QMainWindow):
             self._status_pill.setToolTip("")
             if self._injector.apo_installed:
                 self._status_pill.setStyleSheet(
-                    "background: #1E2E24; color: #9FC5AA; border: 1px solid #2F4A38; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
+                    "background: #18231F; color: #89C2A4; border: 1px solid #2A4037; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
                 )
             else:
                 self._status_pill.setStyleSheet(
@@ -3690,7 +3806,11 @@ class MainWindow(QMainWindow):
         mode_lbl = t("main.apo_active_short") if self._injector.apo_installed else t("main.apo_preview_short")
         if enh_off:
             mode_lbl = t("main.enhancements_off")
-        self._status_bar_lbl.setText(t("main.status_bar", buf_state=buf_state, device=cap_dev, mic=mic_label, mode=mode_lbl))
+        if time.monotonic() >= self._status_override_until:
+            self._status_bar_lbl.setStyleSheet(
+                "color: #8B8B96; font-size: 11px; padding-top: 2px; border-top: 1px solid #1E1E24;"
+            )
+            self._status_bar_lbl.setText(t("main.status_bar", buf_state=buf_state, device=cap_dev, mic=mic_label, mode=mode_lbl))
 
     def restore_all_mics_action(self) -> None:
         self._start_apo_action("restore-all", None, "main.restoring", "main.apo_status_restoring")
@@ -4142,6 +4262,7 @@ class MainWindow(QMainWindow):
 
     def _show_clip_context_menu(self, card: QWidget, pos, entry: ClipEntry) -> None:
         menu = QMenu(self)
+        preview_act = menu.addAction(t("main.ctx_preview"))
         play_act = menu.addAction(t("main.ctx_play"))
         edit_act = menu.addAction(t("main.ctx_edit"))
         export_act = menu.addAction(t("main.ctx_export"))
@@ -4149,7 +4270,9 @@ class MainWindow(QMainWindow):
         del_act = menu.addAction(t("main.ctx_delete"))
 
         chosen = menu.exec(card.mapToGlobal(pos))
-        if chosen is play_act:
+        if chosen is preview_act:
+            self.preview_clip_by_id(entry.id)
+        elif chosen is play_act:
             self.play_clip_by_id(entry.id)
         elif chosen is edit_act:
             self._edit_clip(entry)
@@ -4159,6 +4282,8 @@ class MainWindow(QMainWindow):
             self._delete_clip(entry)
 
     def _delete_clip(self, entry: ClipEntry) -> None:
+        if self._playing_clip_id == entry.id:
+            self.stop_all_audio()
         self._clips = [c for c in self._clips if c.id != entry.id]
         wav_path = resolve_clip_path(entry.file)
         if wav_path.is_file():
@@ -4169,26 +4294,72 @@ class MainWindow(QMainWindow):
         self._rebuild_clip_list()
         self._persist_and_bind()
 
-    def play_clip_by_id(self, clip_id: str) -> None:
+    def _start_saved_clip(self, clip_id: str, *, mode: str) -> None:
         entry = next((c for c in self._clips if c.id == clip_id), None)
         if not entry:
             return
+        if self._playing_clip_id == clip_id and self._playing_clip_mode == mode:
+            self.stop_all_audio()
+            return
+
+        # Always stop any active audio (saved clip, picker, or trim dialog) first
+        self._clip_play_seq += 1
+        self._playing_clip_id = None
+        self._playing_clip_mode = None
+        self._injector.stop_all()
+        self._stop_other_dialog_playback()
+        self._sync_clip_playback_buttons()
+
         wav_path = resolve_clip_path(entry.file)
         if not wav_path.is_file():
+            self._set_status_message(t("main.clip_err_missing_wav", name=entry.name), hold_ms=4500, is_error=True)
             return
+
+        send_to_mic = mode == "mic"
+        if send_to_mic:
+            self._injector.refresh_apo_status()
+            if not self._injector.apo_installed:
+                self._set_status_message(t("main.clip_err_apo_disabled"), hold_ms=5000, is_error=True)
+                return
+            if not self._injector.ensure_ring_ready():
+                self._set_status_message(t("main.clip_err_ring_unavailable"), hold_ms=5000, is_error=True)
+                return
+
         mon, mon_vol, mic_vol = self.get_volumes()
-        self._stop_btn.setEnabled(True)
-        self._stop_btn.setObjectName("Danger")
-        self._stop_btn.style().unpolish(self._stop_btn)
-        self._stop_btn.style().polish(self._stop_btn)
-        self._injector.play_wav(
-            wav_path,
-            volume=mon_vol,
-            mic_volume=mic_vol,
-            send_to_mic=True,
-            monitor_enabled=mon,
-            on_done=self.clip_playback_done.emit,
-        )
+        seq = self._clip_play_seq
+        self._playing_clip_id = clip_id
+        self._playing_clip_mode = mode
+        self._sync_clip_playback_buttons()
+        status_key = "main.status_playing_mic" if send_to_mic else "main.status_previewing_clip"
+        self._set_status_message(t(status_key, name=entry.name), hold_ms=60000, is_error=False)
+
+        try:
+            started = self._injector.play_wav(
+                wav_path,
+                volume=mon_vol,
+                mic_volume=mic_vol,
+                send_to_mic=send_to_mic,
+                monitor_enabled=mon if send_to_mic else True,
+                on_done=lambda s=seq: self.clip_playback_done.emit(s),
+            )
+        except Exception as exc:
+            self._playing_clip_id = None
+            self._playing_clip_mode = None
+            self._sync_clip_playback_buttons()
+            self._set_status_message(t("main.clip_err_playback_failed", err=exc), hold_ms=5000, is_error=True)
+            return
+
+        if not started:
+            self._playing_clip_id = None
+            self._playing_clip_mode = None
+            self._sync_clip_playback_buttons()
+            self._set_status_message(t("main.clip_err_playback_failed", err="Empty audio"), hold_ms=4000, is_error=True)
+
+    def play_clip_by_id(self, clip_id: str) -> None:
+        self._start_saved_clip(clip_id, mode="mic")
+
+    def preview_clip_by_id(self, clip_id: str) -> None:
+        self._start_saved_clip(clip_id, mode="preview")
 
     def _on_clip_hotkey_changed(self, clip_id: str, hk: str) -> None:
         for c in self._clips:
@@ -4203,6 +4374,7 @@ class MainWindow(QMainWindow):
             w = item.widget()
             if w:
                 w.deleteLater()
+        self._clip_row_buttons.clear()
 
         n_clips = len(self._clips)
         self._count_lbl.setText(
@@ -4226,6 +4398,19 @@ class MainWindow(QMainWindow):
             return
 
         for idx, clip in enumerate(self._clips):
+            row_container = QWidget()
+            row_container.setObjectName("ClipRow")
+            outer_row = QHBoxLayout(row_container)
+            outer_row.setContentsMargins(0, 0, 0, 0)
+            outer_row.setSpacing(8)
+
+            export_btn = QPushButton(t("main.clip_export_btn"))
+            export_btn.setObjectName("ExportCard")
+            export_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+            export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            export_btn.setToolTip(t("main.clip_export_tooltip"))
+            export_btn.clicked.connect(lambda _=False, c=clip: self._export_clip_mp3(c))
+
             card = QFrame()
             card.setObjectName("Card")
             card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -4253,6 +4438,10 @@ class MainWindow(QMainWindow):
             hk_btn.setMinimumWidth(86)
             hk_btn.hotkey_changed.connect(lambda hk, cid=clip.id: self._on_clip_hotkey_changed(cid, hk))
 
+            preview_btn = QPushButton(t("main.clip_preview_btn"))
+            preview_btn.setToolTip(t("main.clip_preview_tooltip"))
+            preview_btn.clicked.connect(lambda _=False, cid=clip.id: self.preview_clip_by_id(cid))
+
             play_btn = QPushButton(t("main.clip_play_btn"))
             play_btn.setObjectName("Accent")
             play_btn.setToolTip(t("main.clip_play_tooltip"))
@@ -4261,10 +4450,6 @@ class MainWindow(QMainWindow):
             edit_btn = QPushButton(t("main.clip_edit_btn"))
             edit_btn.setToolTip(t("main.clip_edit_tooltip"))
             edit_btn.clicked.connect(lambda _=False, c=clip: self._edit_clip(c))
-
-            export_btn = QPushButton(t("main.clip_export_btn"))
-            export_btn.setToolTip(t("main.clip_export_tooltip"))
-            export_btn.clicked.connect(lambda _=False, c=clip: self._export_clip_mp3(c))
 
             del_btn = QPushButton("✕")
             del_btn.setObjectName("Danger")
@@ -4275,8 +4460,14 @@ class MainWindow(QMainWindow):
             row.addLayout(info, 1)
             row.addWidget(hk_btn)
             row.addSpacing(6)
+            row.addWidget(preview_btn)
             row.addWidget(play_btn)
             row.addWidget(edit_btn)
-            row.addWidget(export_btn)
             row.addWidget(del_btn)
-            self._list_layout.insertWidget(idx, card)
+
+            outer_row.addWidget(export_btn)
+            outer_row.addWidget(card, 1)
+            self._clip_row_buttons[clip.id] = (preview_btn, play_btn)
+            self._list_layout.insertWidget(idx, row_container)
+
+        self._sync_clip_playback_buttons()

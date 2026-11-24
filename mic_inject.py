@@ -91,7 +91,7 @@ class DirectMicRing:
         self._mm: Optional[mmap.mmap] = None
         self._write_pos = 0
         self._mask = RING_CAPACITY - 1
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def ensure_open(self) -> bool:
         with self._lock:
@@ -236,6 +236,9 @@ class MicInjector:
             self._ring.ensure_open()
         return self._status_cache
 
+    def ensure_ring_ready(self) -> bool:
+        return bool(self._ring.ensure_open())
+
     def apo_status(self) -> dict:
         return dict(self._status_cache)
 
@@ -308,9 +311,9 @@ class MicInjector:
         monitor_enabled: bool = True,
         start_sec: float = 0.0,
         on_done: Optional[Callable[[], None]] = None,
-    ) -> None:
+    ) -> bool:
         data, sr = read_wav(wav_path)
-        self.play_array(
+        return self.play_array(
             data,
             sr,
             volume=volume,
@@ -332,10 +335,13 @@ class MicInjector:
         monitor_enabled: bool = True,
         start_sec: float = 0.0,
         on_done: Optional[Callable[[], None]] = None,
-    ) -> None:
+    ) -> bool:
         call_done_immediately = False
+        started = False
         with self._play_lock:
             self.stop()
+            with self._lock:
+                base_gen = self._play_gen
             sr = int(sample_rate)
             arr = np.asarray(audio)
             if arr.size == 0 or sr <= 0:
@@ -355,53 +361,60 @@ class MicInjector:
                         call_done_immediately = True
                     else:
                         stop_evt = threading.Event()
+                        aborted = False
                         with self._lock:
-                            self._play_gen += 1
-                            gen = self._play_gen
-                            self._stop_event = stop_evt
-                            self._on_done = on_done
-                        pending = {"count": (1 if use_apo else 0) + (1 if play_speaker else 0)}
+                            if self._play_gen != base_gen:
+                                aborted = True
+                            else:
+                                self._play_gen += 1
+                                gen = self._play_gen
+                                self._stop_event = stop_evt
+                                self._on_done = on_done
+                        if not aborted:
+                            started = True
+                            pending = {"count": (1 if use_apo else 0) + (1 if play_speaker else 0)}
 
-                        def mark_done():
-                            cb = None
-                            with self._lock:
-                                if gen != self._play_gen or stop_evt.is_set():
-                                    return
-                                pending["count"] -= 1
-                                if pending["count"] <= 0:
-                                    self._playing = False
-                                    cb = self._on_done
-                                    self._on_done = None
-                            if cb:
-                                try:
-                                    cb()
-                                except Exception:
-                                    pass
+                            def mark_done():
+                                cb = None
+                                with self._lock:
+                                    if gen != self._play_gen or stop_evt.is_set():
+                                        return
+                                    pending["count"] -= 1
+                                    if pending["count"] <= 0:
+                                        self._playing = False
+                                        cb = self._on_done
+                                        self._on_done = None
+                                if cb:
+                                    try:
+                                        cb()
+                                    except Exception:
+                                        pass
 
-                        if use_apo:
-                            mono_48k = _to_48k_mono(arr, sr)
-                            if fade_in and mono_48k.size > 1:
-                                mono_48k = mono_48k.copy()
-                                fn = min(mono_48k.size, 120)
-                                mono_48k[:fn] *= np.linspace(0.0, 1.0, fn, dtype=np.float32)
-                            apo_gain = float(np.clip(volume if mic_volume is None else mic_volume, 0.0, 2.0))
-                            self._start_apo_stream(
-                                mono_48k, gain=apo_gain, gen=gen, stop_evt=stop_evt, on_done=mark_done
-                            )
+                            if use_apo:
+                                mono_48k = _to_48k_mono(arr, sr)
+                                if fade_in and mono_48k.size > 1:
+                                    mono_48k = mono_48k.copy()
+                                    fn = min(mono_48k.size, 120)
+                                    mono_48k[:fn] *= np.linspace(0.0, 1.0, fn, dtype=np.float32)
+                                apo_gain = float(np.clip(volume if mic_volume is None else mic_volume, 0.0, 2.0))
+                                self._start_apo_stream(
+                                    mono_48k, gain=apo_gain, gen=gen, stop_evt=stop_evt, on_done=mark_done
+                                )
 
-                        if play_speaker:
-                            self._start_speaker_stream(
-                                arr,
-                                sr,
-                                volume=float(np.clip(volume, 0.0, 2.0)),
-                                fade_in=fade_in,
-                                gen=gen,
-                                stop_evt=stop_evt,
-                                on_done=mark_done,
-                            )
+                            if play_speaker:
+                                self._start_speaker_stream(
+                                    arr,
+                                    sr,
+                                    volume=float(np.clip(volume, 0.0, 2.0)),
+                                    fade_in=fade_in,
+                                    gen=gen,
+                                    stop_evt=stop_evt,
+                                    on_done=mark_done,
+                                )
 
         if call_done_immediately and on_done:
             on_done()
+        return started
 
     def _start_apo_stream(
         self,

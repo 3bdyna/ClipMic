@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QByteArray, QEvent, QObject, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -77,257 +79,491 @@ from hotkeys import (
 from i18n import get_lang, is_rtl, localize_effect_name, ltr, set_lang, t
 from mic_inject import MicInjector, list_microphones
 
-DARK_QSS = """
-QWidget {
-    background-color: #0B0B0C;
-    color: #F2F2F4;
-    font-family: "Segoe UI", sans-serif;
+# Tactile Field-Recorder / Hardware Audio Deck Design Tokens
+_MONO_FONT = '"IBM Plex Mono", "Cascadia Mono", Consolas, monospace'
+_UI_FONT = '"Inter", "Segoe UI Variable", "Segoe UI", sans-serif'
+
+_SVG_PATHS: dict[str, str] = {
+    "sliders": (
+        '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/>'
+        '<line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/>'
+        '<line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/>'
+        '<line x1="2" y1="14" x2="6" y2="14"/><line x1="10" y1="8" x2="14" y2="8"/>'
+        '<line x1="18" y1="16" x2="22" y2="16"/>'
+    ),
+    "scissors": (
+        '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>'
+        '<line x1="20" y1="4" x2="8.12" y2="15.88"/>'
+        '<line x1="14.47" y1="14.48" x2="20" y2="20"/>'
+        '<line x1="8.12" y1="8.12" x2="12" y2="12"/>'
+    ),
+    "stop": '<rect x="5" y="5" width="14" height="14" rx="2"/>',
+    "play": '<polygon points="6 4 20 12 6 20 6 4"/>',
+    "refresh": (
+        '<polyline points="23 4 23 10 17 10"/>'
+        '<path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>'
+    ),
+    "chevron_down": '<polyline points="6 9 12 15 18 9"/>',
+    "chevron_right": '<polyline points="9 18 15 12 9 6"/>',
+    "chevron_left": '<polyline points="15 18 9 12 15 6"/>',
+    "download": (
+        '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>'
+        '<polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>'
+    ),
+    "upload": (
+        '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>'
+        '<polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>'
+    ),
+    "speaker": (
+        '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>'
+        '<path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>'
+        '<path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>'
+    ),
+    "mic": (
+        '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>'
+        '<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>'
+        '<line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>'
+    ),
+    "loop": (
+        '<polyline points="17 1 21 5 17 9"/>'
+        '<path d="M3 11V9a4 4 0 0 1 4-4h14"/>'
+        '<polyline points="7 23 3 19 7 15"/>'
+        '<path d="M21 13v2a4 4 0 0 1-4 4H3"/>'
+    ),
+    "edit": (
+        '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>'
+        '<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>'
+    ),
+    "close": '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+}
+
+_SVG_ICON_CACHE: dict[tuple[str, str, int], QIcon] = {}
+
+
+def _svg_icon(name: str, color: str = "#f2f3f5", size: int = 14) -> QIcon:
+    """Render a crisp uniform-stroke (stroke-width=2) inline SVG into a cached HiDPI QIcon."""
+    key = (name, color, size)
+    cached = _SVG_ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    body = _SVG_PATHS.get(name, "")
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+        f'fill="none" stroke="{color}" stroke-width="2" '
+        f'stroke-linecap="round" stroke-linejoin="round">{body}</svg>'
+    )
+    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+    dpr = 2.0
+    px = max(1, int(round(size * dpr)))
+    pm = QPixmap(px, px)
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    renderer.render(p, QRectF(0, 0, size, size))
+    p.end()
+    icon = QIcon(pm)
+    _SVG_ICON_CACHE[key] = icon
+    return icon
+
+
+DARK_QSS = f"""
+QWidget {{
+    background-color: #25272b;
+    color: #f2f3f5;
+    font-family: {_UI_FONT};
     font-size: 13px;
-}
-QLabel, QCheckBox {
+}}
+QLabel, QCheckBox {{
     background-color: transparent;
-}
-QCheckBox {
-    spacing: 6px;
-    color: #D4D4D8;
-}
-QFrame#Card {
-    background-color: #141417;
-    border: 1px solid #22222A;
-    border-radius: 10px;
-}
-QPushButton#SectionToggle {
+}}
+QCheckBox {{
+    spacing: 7px;
+    color: #b4b9c2;
+}}
+QCheckBox:hover {{
+    color: #f2f3f5;
+}}
+QCheckBox:focus {{
+    color: #f2f3f5;
+}}
+QFrame#Card {{
+    background-color: #2e3136;
+    border: 1px solid #191b1e;
+    border-top: 1px solid #3c4047;
+    border-bottom: 2px solid #181a1d;
+    border-radius: 8px;
+}}
+QFrame#Divider {{
+    background-color: #191b1e;
+    border: none;
+    min-height: 1px;
+    max-height: 1px;
+}}
+QFrame#StatusBadge {{
+    background-color: #121a15;
+    border: 1px solid #2a4735;
+    border-radius: 5px;
+}}
+QFrame#OledStrip, QFrame#OledReadout {{
+    background-color: #141618;
+    border: 1px solid #191b1e;
+    border-radius: 5px;
+}}
+QFrame#SegmentedControl {{
+    background-color: #141618;
+    border: 1px solid #191b1e;
+    border-radius: 5px;
+}}
+QFrame#FooterStrip {{
+    background-color: #202226;
+    border-top: 1px solid #191b1e;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
+}}
+QPushButton#SectionToggle {{
     background-color: transparent;
-    color: #9CA3AF;
+    color: #848a94;
     border: 1px solid transparent;
-    border-radius: 6px;
-    padding: 4px 10px;
+    border-radius: 5px;
+    padding: 4px 8px;
     font-size: 12px;
-    font-weight: 600;
-}
-QPushButton#SectionToggle:hover {
-    background-color: #141419;
-    border-color: #22222A;
-    color: #E4E4E7;
-}
-QFrame#EmptyStateCard {
-    background-color: #111115;
-    border: 1px dashed #2A2A34;
-    border-radius: 10px;
-}
-QPushButton {
-    background-color: #1D1D22;
-    color: #EAEAEF;
-    border: 1px solid #2E2E36;
-    border-radius: 7px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+}}
+QPushButton#SectionToggle:hover {{
+    background-color: #2e3136;
+    border-color: #191b1e;
+    color: #f2f3f5;
+}}
+QPushButton#SectionToggle:focus {{
+    border: 2px solid #ff8659;
+}}
+QFrame#EmptyStateCard {{
+    background-color: #202226;
+    border: 1px dashed #4d525c;
+    border-radius: 8px;
+}}
+QPushButton {{
+    background-color: #3a3e45;
+    color: #f2f3f5;
+    border: 1px solid #191b1e;
+    border-top: 1px solid #4e535c;
+    border-bottom: 2px solid #181a1d;
+    border-radius: 5px;
     padding: 6px 12px;
     font-weight: 600;
-}
-QPushButton:hover {
-    background-color: #27272E;
-    border-color: #3F3F4A;
-}
-QPushButton:pressed {
-    background-color: #18181C;
-}
-QPushButton:disabled {
-    color: #63636D;
-    background-color: #151518;
-    border-color: #222227;
-}
-QPushButton#Primary {
-    background-color: #F4F4F5;
-    border-color: #F4F4F5;
-    color: #0B0B0C;
-}
-QPushButton#Primary:hover {
-    background-color: #E2E2E6;
-    border-color: #E2E2E6;
-}
-QPushButton#Accent {
-    background-color: #18231F;
-    border-color: #2A4037;
-    color: #89C2A4;
-}
-QPushButton#Accent:hover {
-    background-color: #1F2E28;
-    border-color: #3A594C;
-    color: #A3D4BA;
-}
-QPushButton#Danger {
-    background-color: #251B1D;
-    border-color: #462D32;
-    color: #D48E95;
-}
-QPushButton#Danger:hover {
-    background-color: #302124;
-    border-color: #5C3A41;
-    color: #E2A8AE;
-}
-QPushButton#StopIdle, QPushButton#StopIdle:disabled {
-    background-color: #111114;
-    border: 1px dashed #25252D;
-    color: #55555F;
-    font-weight: 500;
-}
-QPushButton#ExportCard {
-    background-color: #141417;
-    color: #C8C8D0;
-    border: 1px solid #22222A;
-    border-radius: 10px;
-    padding: 4px 10px;
+}}
+QPushButton:hover {{
+    background-color: #454a52;
+    border-top: 1px solid #595f69;
+}}
+QPushButton:pressed {{
+    background-color: #32363c;
+    border-top: 1px solid #191b1e;
+    border-bottom: 1px solid #181a1d;
+    padding-top: 7px;
+    padding-bottom: 5px;
+}}
+QPushButton:focus {{
+    border: 2px solid #ff8659;
+}}
+QPushButton:disabled {{
+    color: #848a94;
+    background-color: #2a2d32;
+    border: 1px solid #191b1e;
+}}
+QPushButton#Primary {{
+    background-color: #ff6229;
+    border: 1px solid #b83d10;
+    border-top: 1px solid #ff9a75;
+    border-bottom: 3px solid #8a2c0a;
+    color: #121212;
+    font-weight: 700;
+}}
+QPushButton#Primary:hover {{
+    background-color: #ff7542;
+    border-top: 1px solid #ffae8f;
+}}
+QPushButton#Primary:pressed {{
+    background-color: #e85620;
+    border-top: 1px solid #b83d10;
+    border-bottom: 1px solid #8a2c0a;
+    padding-top: 8px;
+    padding-bottom: 5px;
+}}
+QPushButton#Primary:focus {{
+    border: 2px solid #ff8659;
+}}
+QPushButton#KeycapBtn {{
+    background-color: #141618;
+    color: #f2f3f5;
+    border: 1px solid #191b1e;
+    border-bottom: 2px solid #0e1012;
+    border-radius: 5px;
+    padding: 5px 10px;
+    font-family: {_MONO_FONT};
     font-size: 12px;
     font-weight: 600;
-}
-QWidget#ClipRow QPushButton {
+}}
+QPushButton#KeycapBtn:hover {{
+    background-color: #1b1e21;
+    border-color: #4d525c;
+}}
+QPushButton#KeycapBtn:pressed {{
+    background-color: #101214;
+    padding-top: 6px;
+    padding-bottom: 4px;
+}}
+QPushButton#KeycapBtn:focus {{
+    border: 2px solid #ff8659;
+}}
+QPushButton#Accent {{
+    background-color: #121a15;
+    border: 1px solid #2a4735;
+    border-top: 1px solid #365a44;
+    border-bottom: 2px solid #0d1410;
+    color: #65d692;
+}}
+QPushButton#Accent:hover {{
+    background-color: #18241d;
+    border-color: #3a634a;
+    color: #7ee3a6;
+}}
+QPushButton#Accent:pressed {{
+    background-color: #0f1612;
+    padding-top: 7px;
+    padding-bottom: 5px;
+}}
+QPushButton#Danger {{
+    background-color: #2a1818;
+    border: 1px solid #592b2b;
+    border-top: 1px solid #6e3636;
+    border-bottom: 2px solid #1a0f0f;
+    color: #f28c8c;
+}}
+QPushButton#Danger:hover {{
+    background-color: #361e1e;
+    border-color: #753939;
+    color: #f7a6a6;
+}}
+QPushButton#Danger:pressed {{
+    background-color: #221313;
+    padding-top: 7px;
+    padding-bottom: 5px;
+}}
+QPushButton#StopIdle, QPushButton#StopIdle:disabled {{
+    background-color: transparent;
+    border: 1px dashed #4d525c;
+    color: #848a94;
+    font-weight: 600;
+}}
+QPushButton#ExportCard {{
+    background-color: #2e3136;
+    color: #b4b9c2;
+    border: 1px solid #191b1e;
+    border-top: 1px solid #3c4047;
+    border-bottom: 2px solid #181a1d;
+    border-radius: 5px;
     padding: 4px 10px;
-}
-QPushButton#ExportCard:hover {
-    background-color: #1C1C22;
-    border-color: #343440;
-    color: #F2F2F4;
-}
-QPushButton#ExportCard:pressed {
-    background-color: #111115;
-    border-color: #2A2A34;
-}
-QMenu {
-    background-color: #141417;
-    color: #F2F2F4;
-    border: 1px solid #2E2E36;
-    border-radius: 6px;
+    font-family: {_MONO_FONT};
+    font-size: 11px;
+    font-weight: 700;
+}}
+QWidget#ClipRow QPushButton {{
+    padding: 4px 8px;
+    font-size: 12px;
+}}
+QPushButton#ExportCard:hover {{
+    background-color: #3a3e45;
+    border-color: #4d525c;
+    color: #f2f3f5;
+}}
+QPushButton#ExportCard:pressed {{
+    background-color: #26292e;
+    padding-top: 6px;
+    padding-bottom: 4px;
+}}
+QMenu {{
+    background-color: #2e3136;
+    color: #f2f3f5;
+    border: 1px solid #4d525c;
+    border-radius: 5px;
     padding: 4px;
-}
-QMenu::item {
+}}
+QMenu::item {{
     padding: 6px 14px;
     border-radius: 4px;
-}
-QMenu::item:selected {
-    background-color: #27272E;
-    color: #FFFFFF;
-}
-QMenu::separator {
+}}
+QMenu::item:selected {{
+    background-color: #3a3e45;
+    color: #f2f3f5;
+}}
+QMenu::separator {{
     height: 1px;
-    background: #25252B;
+    background: #191b1e;
     margin: 4px 6px;
-}
-QPushButton#PresetBtn {
-    background-color: #18181C;
-    border: 1px solid #292930;
+}}
+QPushButton#PresetBtn {{
+    background-color: #3a3e45;
+    border: 1px solid #191b1e;
+    border-top: 1px solid #4e535c;
+    border-bottom: 2px solid #181a1d;
     padding: 6px 10px;
     font-weight: 500;
-    color: #D4D4D8;
-}
-QPushButton#PresetBtn:checked {
-    background-color: #18231F;
-    border: 1px solid #2A4037;
-    color: #89C2A4;
+    color: #b4b9c2;
+}}
+QPushButton#PresetBtn:checked {{
+    background-color: #121a15;
+    border: 1px solid #2a4735;
+    color: #65d692;
     font-weight: 700;
-}
-QPushButton#ChangeChannelsBtn {
-    background-color: #1D2B3D;
-    border: 1px solid #3B6BA5;
-    color: #DBEAFE;
+}}
+QPushButton#ChangeChannelsBtn {{
+    background-color: #3a3e45;
+    border: 1px solid #4d525c;
+    border-bottom: 2px solid #181a1d;
+    color: #f2f3f5;
     padding: 6px 12px;
     font-weight: 700;
-}
-QPushButton#ChangeChannelsBtn:hover {
-    background-color: #253A54;
-    border-color: #60A5FA;
-    color: #FFFFFF;
-}
-QPushButton#ChangeChannelsBtn:pressed {
-    background-color: #172333;
-}
-QPushButton#BufPresetBtn {
-    background-color: #16161B;
-    border: 1px solid #2A2A32;
-    border-radius: 6px;
-    padding: 5px 12px;
+}}
+QPushButton#ChangeChannelsBtn:hover {{
+    background-color: #454a52;
+    border-color: #ff6229;
+}}
+QPushButton#ChangeChannelsBtn:pressed {{
+    background-color: #2e3136;
+}}
+QPushButton#BufPresetBtn {{
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-family: {_MONO_FONT};
     font-size: 12px;
     font-weight: 600;
-    color: #A1A1AA;
-}
-QPushButton#BufPresetBtn:hover {
-    background-color: #22222A;
-    border-color: #3F3F4A;
-    color: #F4F4F5;
-}
-QPushButton#BufPresetBtn:checked {
-    background-color: #18231F;
-    border-color: #2A4037;
-    color: #89C2A4;
-}
-QFrame#DropZone {
-    background-color: #111115;
-    border: 1px dashed #32323D;
+    color: #848a94;
+}}
+QPushButton#BufPresetBtn:hover {{
+    background-color: #25272b;
+    color: #f2f3f5;
+}}
+QPushButton#BufPresetBtn:checked {{
+    background-color: #121a15;
+    border: 1px solid #2a4735;
+    color: #65d692;
+}}
+QPushButton#BufPresetBtn:focus {{
+    border: 2px solid #ff8659;
+}}
+QFrame#DropZone {{
+    background-color: #202226;
+    border: 1px dashed #4d525c;
     border-radius: 8px;
-}
-QFrame#DropZone:hover {
-    background-color: #16161C;
-    border-color: #4A4A5A;
-}
-QFrame#DropZone[dragOver="true"] {
-    background-color: #192638;
-    border: 1px dashed #60A5FA;
-}
-QLineEdit, QComboBox, QSpinBox {
-    background-color: #101013;
-    border: 1px solid #2B2B33;
-    border-radius: 6px;
+}}
+QFrame#DropZone:hover {{
+    background-color: #26292e;
+    border-color: #848a94;
+}}
+QFrame#DropZone[dragOver="true"] {{
+    background-color: #2b2320;
+    border: 1px dashed #ff6229;
+}}
+QLineEdit, QComboBox, QSpinBox {{
+    background-color: #141618;
+    border: 1px solid #191b1e;
+    border-radius: 5px;
     padding: 6px 10px;
-    color: #F2F2F4;
-}
-QSpinBox {
+    color: #f2f3f5;
+}}
+QSpinBox {{
     padding: 3px 6px;
+    font-family: {_MONO_FONT};
     font-size: 12px;
-}
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
-    border-color: #71717A;
-}
-QComboBox::drop-down {
+    font-weight: 600;
+}}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
+    border: 2px solid #ff8659;
+}}
+QComboBox::drop-down {{
     border: none;
     width: 24px;
     background: transparent;
-}
-QComboBox QAbstractItemView {
-    background-color: #141417;
-    color: #F2F2F4;
-    border: 1px solid #32323B;
-    selection-background-color: #2A2A32;
-    selection-color: #FFFFFF;
+}}
+QComboBox QAbstractItemView {{
+    background-color: #202226;
+    color: #f2f3f5;
+    border: 1px solid #4d525c;
+    selection-background-color: #3a3e45;
+    selection-color: #f2f3f5;
     outline: 0;
     padding: 4px;
-}
-QSlider::groove:horizontal {
-    height: 4px;
-    background: #27272E;
+}}
+QSlider::groove:horizontal {{
+    height: 6px;
+    background: #141618;
+    border: 1px solid #191b1e;
     border-radius: 2px;
-}
-QSlider::handle:horizontal {
-    background: #E4E4E7;
-    width: 13px;
-    height: 13px;
-    margin: -5px 0;
-    border-radius: 6px;
-}
-QScrollArea {
+}}
+QSlider::sub-page:horizontal {{
+    background: #4d525c;
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: #ff6229;
+    border: 1px solid #000000;
+    width: 12px;
+    height: 16px;
+    margin: -6px 0;
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal:hover {{
+    background: #ff7542;
+}}
+QSlider::handle:horizontal:disabled {{
+    background: #4d525c;
+    border: 1px solid #191b1e;
+}}
+QScrollArea {{
     border: none;
     background: transparent;
-}
-QToolTip {
-    background-color: #18181D;
-    color: #F4F4F5;
-    border: 1px solid #3A3A46;
-    border-radius: 6px;
+}}
+QScrollBar:vertical {{
+    background: #202226;
+    width: 8px;
+    border-radius: 4px;
+    margin: 2px 0;
+}}
+QScrollBar::handle:vertical {{
+    background: #3a3e45;
+    border-radius: 4px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: #4d525c;
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0px;
+}}
+QToolTip {{
+    background-color: #141618;
+    color: #f2f3f5;
+    border: 1px solid #4d525c;
+    border-radius: 5px;
     padding: 6px 10px;
     font-size: 12px;
-}
+}}
 """
 
 
 class _ClipMicStyle(QProxyStyle):
-    """Draw crisp dark checkboxes with a clear border and vector checkmark."""
+    """Draw hardware checkboxes with OLED green fill and enforce pointer cursors on interactive widgets."""
+
+    def polish(self, arg) -> None:
+        super().polish(arg)
+        if isinstance(arg, (QPushButton, QCheckBox, QComboBox, QSlider)):
+            arg.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def pixelMetric(self, metric, option=None, widget=None) -> int:
         if metric in (
@@ -343,25 +579,26 @@ class _ClipMicStyle(QProxyStyle):
             enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
             checked = bool(option.state & QStyle.StateFlag.State_On)
             hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+            focused = bool(option.state & QStyle.StateFlag.State_HasFocus)
 
             painter.save()
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             if not enabled:
-                fill = QColor("#151518")
-                border = QColor("#25252C")
+                fill = QColor("#141618")
+                border = QColor("#2a2d32")
             elif checked:
-                fill = QColor("#18231F")
-                border = QColor("#66A686" if hovered else "#2A4037")
+                fill = QColor("#121a15")
+                border = QColor("#ff8659" if focused else ("#65d692" if hovered else "#2a4735"))
             else:
-                fill = QColor("#1C1C22" if hovered else "#161619")
-                border = QColor("#565666" if hovered else "#3A3A44")
+                fill = QColor("#1c1f23" if hovered else "#141618")
+                border = QColor("#ff8659" if focused else ("#848a94" if hovered else "#4d525c"))
 
             painter.setBrush(fill)
-            painter.setPen(QPen(border, 1.4 if checked else 1.1))
-            painter.drawRoundedRect(rect, 4.0, 4.0)
+            painter.setPen(QPen(border, 1.5 if (checked or focused) else 1.1))
+            painter.drawRoundedRect(rect, 3.0, 3.0)
 
             if checked:
-                ck_pen = QPen(QColor("#89C2A4" if enabled else "#6B7280"), 1.8)
+                ck_pen = QPen(QColor("#65d692" if enabled else "#848a94"), 1.9)
                 ck_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
                 ck_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
                 painter.setPen(ck_pen)
@@ -404,7 +641,7 @@ def _trim_working_set() -> None:
         pass
 
 
-def apply_dark_titlebar(widget: QWidget, bg_hex: str = "#0B0B0C") -> None:
+def apply_dark_titlebar(widget: QWidget, bg_hex: str = "#1a1c1f") -> None:
     """Apply Windows 10/11 dark native title bar matching ClipMic's background."""
     if sys.platform != "win32":
         return
@@ -500,6 +737,7 @@ class HotkeyCaptureButton(QPushButton):
 
     def __init__(self, initial: str = "", allow_empty: bool = True, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("KeycapBtn")
         self._hotkey = initial.strip()
         self._allow_empty = allow_empty
         self._capturing = False
@@ -602,17 +840,17 @@ class WaveformWidget(QWidget):
     playhead_scrubbed = Signal(float)
     playhead_scrub_finished = Signal(float)
 
-    _BG_COLOR = QColor("#0F0F12")
-    _BORDER_PEN = QPen(QColor("#26262C"), 1)
-    _BASE_PEN = QPen(QColor("#222228"), 1)
-    _BAR_DIM = QColor("#3A3A44")
-    _BAR_LIT = QColor("#E4E4E7")
-    _SEL_FILL = QColor(244, 244, 245, 22)
-    _START_COLOR = QColor("#66A686")
-    _END_COLOR = QColor("#C2A878")
+    _BG_COLOR = QColor("#141618")
+    _BORDER_PEN = QPen(QColor("#191b1e"), 1)
+    _BASE_PEN = QPen(QColor("#25272b"), 1)
+    _BAR_DIM = QColor("#3a3e45")
+    _BAR_LIT = QColor("#f2f3f5")
+    _SEL_FILL = QColor(101, 214, 146, 20)
+    _START_COLOR = QColor("#65d692")
+    _END_COLOR = QColor("#ff6229")
     _START_PEN = QPen(_START_COLOR, 2)
     _END_PEN = QPen(_END_COLOR, 2)
-    _PLAYHEAD_COLOR = QColor("#FFFFFF")
+    _PLAYHEAD_COLOR = QColor("#ff8659")
     _PLAYHEAD_PEN = QPen(_PLAYHEAD_COLOR, 2)
 
     def __init__(self, parent=None) -> None:
@@ -1598,12 +1836,12 @@ class MiniWaveformWidget(QWidget):
     seek_moved = Signal(float)
     seek_released = Signal(float)
 
-    _BG = QColor("#0F0F12")
-    _BORDER = QPen(QColor("#26262C"), 1)
-    _MID = QPen(QColor("#1E1E24"), 1)
-    _BAR_ACTIVE = QColor("#D4D4D8")
-    _BAR_MUTED = QColor("#4A4A54")
-    _PLAYHEAD_COLOR = QColor("#FFFFFF")
+    _BG = QColor("#141618")
+    _BORDER = QPen(QColor("#191b1e"), 1)
+    _MID = QPen(QColor("#25272b"), 1)
+    _BAR_ACTIVE = QColor("#f2f3f5")
+    _BAR_MUTED = QColor("#4d525c")
+    _PLAYHEAD_COLOR = QColor("#ff6229")
     _PLAYHEAD = QPen(_PLAYHEAD_COLOR, 2)
 
     def __init__(self, peaks: np.ndarray, checked: bool = True, parent=None) -> None:
@@ -2116,10 +2354,10 @@ class TrimDialog(QDialog):
             buf_lbl = int(buffer_seconds) if buffer_seconds else int(round(self._duration_s))
             title_txt = t("trim.title_capture", n=buf_lbl)
         title = QLabel(title_txt)
-        title.setStyleSheet("font-size: 15px; font-weight: 700; color: #F9FAFB;")
+        title.setStyleSheet("font-size: 15px; font-weight: 700; color: #f2f3f5;")
         self._range_lbl = QLabel()
         self._range_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
-        self._range_lbl.setStyleSheet("color: #9CA3AF; font-family: Consolas, monospace;")
+        self._range_lbl.setStyleSheet(f"color: #65d692; font-family: {_MONO_FONT}; font-size: 12px;")
         hdr.addWidget(title)
         hdr.addStretch()
         hdr.addWidget(self._range_lbl)
@@ -2175,14 +2413,18 @@ class TrimDialog(QDialog):
         # Playback actions
         play_row = QHBoxLayout()
         self._play_btn = QPushButton(t("trim.play_preview_btn"))
+        self._play_btn.setIcon(_svg_icon("play", "#f2f3f5", 13))
+        self._play_btn.setIconSize(QSize(13, 13))
         self._play_btn.setToolTip(t("trim.play_preview_tooltip"))
         self._play_btn.clicked.connect(self._on_play_preview)
         self._send_btn = QPushButton(t("trim.send_mic_btn"))
         self._send_btn.setObjectName("Accent")
+        self._send_btn.setIcon(_svg_icon("mic", "#65d692", 13))
+        self._send_btn.setIconSize(QSize(13, 13))
         self._send_btn.setToolTip(t("trim.send_mic_tooltip"))
         self._send_btn.clicked.connect(self._on_send_to_mic)
         self._status_lbl = QLabel("")
-        self._status_lbl.setStyleSheet("color: #9CA3AF; font-size: 12px;")
+        self._status_lbl.setStyleSheet(f"color: #b4b9c2; font-family: {_MONO_FONT}; font-size: 11px;")
 
         play_row.addWidget(self._play_btn)
         play_row.addWidget(self._send_btn)
@@ -2750,8 +2992,74 @@ class _ApoProcessWorker(QThread):
         self.finished_apo.emit(exit_code, log_text)
 
 
+class _LevelMeterWidget(QWidget):
+    """Crisp 12-segment OLED input level bar for the transport telemetry strip."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(82, 12)
+        self._active = False
+        self._lit = 0
+
+    def set_level(self, active: bool, lit_segments: int = 0) -> None:
+        lit = max(0, min(12, int(lit_segments)))
+        if self._active != bool(active) or self._lit != lit:
+            self._active = bool(active)
+            self._lit = lit
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        seg_w, seg_h, gap = 5, 10, 2
+        y = (self.height() - seg_h) // 2
+        for i in range(12):
+            x = i * (seg_w + gap)
+            if self._active and i < self._lit:
+                color = QColor("#ff6229") if i >= 10 else QColor("#65d692")
+            elif not self._active and i == 0:
+                color = QColor("#2a4735")
+            else:
+                color = QColor("#1f2428")
+            p.fillRect(x, y, seg_w, seg_h, color)
+
+
+class _OledTelemetryStrip(QFrame):
+    """Recessed OLED telemetry strip showing IN-LVL meter and BUF/sample-rate readout."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("OledStrip")
+        self.setFixedHeight(26)
+        self.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setSpacing(8)
+
+        in_lbl = QLabel("IN-LVL")
+        in_lbl.setStyleSheet(
+            f"color: #848a94; font-family: {_MONO_FONT}; font-size: 10px; font-weight: 700; letter-spacing: 0.6px;"
+        )
+        self._meter = _LevelMeterWidget()
+        self._readout = QLabel("BUF:30.0s • 48kHz")
+        self._readout.setStyleSheet(
+            f"color: #65d692; font-family: {_MONO_FONT}; font-size: 11px; font-weight: 600;"
+        )
+
+        lay.addWidget(in_lbl)
+        lay.addWidget(self._meter)
+        lay.addStretch()
+        lay.addWidget(self._readout)
+
+    def update_telemetry(self, buffer_seconds: int, sample_rate: int, active: bool) -> None:
+        khz = sample_rate / 1000.0 if sample_rate > 0 else 48.0
+        khz_txt = f"{khz:.0f}kHz" if abs(khz - round(khz)) < 0.05 else f"{khz:.1f}kHz"
+        self._readout.setText(f"BUF:{float(buffer_seconds):.1f}s • {khz_txt}")
+        self._meter.set_level(active, 7 if active else 0)
+
+
 class _AudioDropZone(QFrame):
-    """Low-profile drag-and-drop & click-to-browse media import bar."""
+    """Perforated hardware dot-matrix drag-and-drop & click-to-browse media import bar."""
 
     file_dropped = Signal(str)
     browse_clicked = Signal()
@@ -2760,17 +3068,33 @@ class _AudioDropZone(QFrame):
         super().__init__(parent)
         self.setObjectName("DropZone")
         self.setAcceptDrops(True)
-        self.setFixedHeight(34)
+        self.setFixedHeight(38)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setProperty("dragOver", False)
         self._custom_status = False
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 2, 12, 2)
+        lay.setSpacing(8)
+        lay.addStretch()
+        self._icon_lbl = QLabel()
+        self._icon_lbl.setPixmap(_svg_icon("upload", "#848a94", 14).pixmap(QSize(14, 14)))
         self._label = QLabel(t("main.drop_default"))
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._label.setStyleSheet("color: #9CA3AF; font-size: 12px; font-weight: 500;")
+        self._label.setStyleSheet("color: #b4b9c2; font-size: 12px; font-weight: 500;")
+        lay.addWidget(self._icon_lbl)
         lay.addWidget(self._label)
+        lay.addStretch()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 15))
+        w, h = self.width(), self.height()
+        for y in range(6, h - 4, 8):
+            for x in range(6, w - 4, 8):
+                p.drawRect(x, y, 1, 1)
 
     def retranslate_ui(self) -> None:
         if not self._custom_status:
@@ -2786,21 +3110,25 @@ class _AudioDropZone(QFrame):
             self.style().unpolish(self)
             self.style().polish(self)
             if val:
+                self._icon_lbl.setPixmap(_svg_icon("upload", "#ff6229", 14).pixmap(QSize(14, 14)))
                 self._label.setText(t("main.drop_hover"))
-                self._label.setStyleSheet("color: #DBEAFE; font-size: 12px; font-weight: 600;")
+                self._label.setStyleSheet("color: #ff8659; font-size: 12px; font-weight: 600;")
             elif not self._custom_status:
+                self._icon_lbl.setPixmap(_svg_icon("upload", "#848a94", 14).pixmap(QSize(14, 14)))
                 self._label.setText(t("main.drop_default"))
-                self._label.setStyleSheet("color: #9CA3AF; font-size: 12px; font-weight: 500;")
+                self._label.setStyleSheet("color: #b4b9c2; font-size: 12px; font-weight: 500;")
 
     def set_status_text(self, text: Optional[str]) -> None:
         if text:
             self._custom_status = True
+            self._icon_lbl.setPixmap(_svg_icon("upload", "#ff6229", 14).pixmap(QSize(14, 14)))
             self._label.setText(text)
-            self._label.setStyleSheet("color: #DBEAFE; font-size: 12px; font-weight: 600;")
+            self._label.setStyleSheet("color: #f2f3f5; font-size: 12px; font-weight: 600;")
         else:
             self._custom_status = False
+            self._icon_lbl.setPixmap(_svg_icon("upload", "#848a94", 14).pixmap(QSize(14, 14)))
             self._label.setText(t("main.drop_default"))
-            self._label.setStyleSheet("color: #9CA3AF; font-size: 12px; font-weight: 500;")
+            self._label.setStyleSheet("color: #b4b9c2; font-size: 12px; font-weight: 500;")
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -2923,7 +3251,12 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        outer = QHBoxLayout(central)
+        central_v = QVBoxLayout(central)
+        central_v.setContentsMargins(0, 0, 0, 0)
+        central_v.setSpacing(0)
+
+        body_host = QWidget()
+        outer = QHBoxLayout(body_host)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
@@ -2935,63 +3268,90 @@ class MainWindow(QMainWindow):
         outer.addStretch(0)
         outer.addWidget(self._content_container, 1)
         outer.addStretch(0)
+        central_v.addWidget(body_host, 1)
 
         root = QVBoxLayout(self._content_container)
-        root.setContentsMargins(18, 16, 18, 12)
+        root.setContentsMargins(18, 14, 18, 10)
         root.setSpacing(10)
 
         # Header & Live Status Badge
         top = QHBoxLayout()
+        top.setSpacing(8)
         brand = QLabel(t("app.title"))
-        brand.setStyleSheet("font-size: 20px; font-weight: 800; color: #F9FAFB;")
+        brand.setStyleSheet("font-size: 20px; font-weight: 800; color: #f2f3f5; letter-spacing: -0.3px;")
+
+        self._status_badge = QFrame()
+        self._status_badge.setObjectName("StatusBadge")
+        badge_lay = QHBoxLayout(self._status_badge)
+        badge_lay.setContentsMargins(8, 4, 10, 4)
+        badge_lay.setSpacing(6)
+        self._status_dot = QFrame()
+        self._status_dot.setFixedSize(7, 7)
+        self._status_dot.setStyleSheet("background-color: #65d692; border-radius: 2px; border: none;")
         self._status_pill = QLabel()
-        self._status_pill.setStyleSheet(
-            "background: #172554; color: #93C5FD; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
-        )
+        self._status_pill.setStyleSheet("color: #65d692; font-size: 11px; font-weight: 600;")
+        badge_lay.addWidget(self._status_dot)
+        badge_lay.addWidget(self._status_pill)
+
         top.addWidget(brand)
-        top.addSpacing(8)
-        top.addWidget(self._status_pill)
+        top.addSpacing(4)
+        top.addWidget(self._status_badge)
         top.addStretch()
+
         self._effects_btn = QPushButton(t("main.effects_btn"))
+        self._effects_btn.setIcon(_svg_icon("sliders", "#f2f3f5", 14))
+        self._effects_btn.setIconSize(QSize(14, 14))
         self._effects_btn.setToolTip(t("main.effects_tooltip"))
         self._effects_btn.clicked.connect(self._open_manage_effects)
         top.addWidget(self._effects_btn)
+
         self._lang_btn = QPushButton(t("lang.toggle_btn"))
-        self._lang_btn.setMinimumWidth(48)
+        self._lang_btn.setMinimumWidth(52)
         self._lang_btn.setToolTip(t("lang.tooltip"))
         self._lang_btn.clicked.connect(self._on_toggle_language)
         top.addWidget(self._lang_btn)
         root.addLayout(top)
 
-        # Instant Capture & Global Stop Bar
+        # Instant Capture, Global Stop Bar & OLED Telemetry Strip
         cap_card = QFrame()
         cap_card.setObjectName("Card")
-        cap_lay = QHBoxLayout(cap_card)
-        cap_lay.setContentsMargins(12, 10, 12, 10)
+        cap_outer = QVBoxLayout(cap_card)
+        cap_outer.setContentsMargins(12, 10, 12, 10)
+        cap_outer.setSpacing(8)
+
+        cap_lay = QHBoxLayout()
         cap_lay.setSpacing(8)
 
         cap_hk = str(self._config.get("capture_hotkey", "F9") or "F9")
         buf_s = self._buffer_seconds()
         self._capture_btn = QPushButton()
         self._capture_btn.setObjectName("Primary")
+        self._capture_btn.setIcon(_svg_icon("scissors", "#121212", 15))
+        self._capture_btn.setIconSize(QSize(15, 15))
         self._capture_btn.setMinimumHeight(38)
         self._capture_btn.clicked.connect(self.capture_last_30s)
 
         self._cap_hotkey_btn = HotkeyCaptureButton(cap_hk, allow_empty=False)
+        self._cap_hotkey_btn.setMinimumHeight(34)
         self._cap_hotkey_btn.hotkey_changed.connect(self._on_capture_hotkey_changed)
 
         stop_hk = str(self._config.get("stop_hotkey", "F10") or "")
         self._stop_btn = QPushButton()
         self._stop_btn.setObjectName("StopIdle")
+        self._stop_btn.setIcon(_svg_icon("stop", "#848a94", 13))
+        self._stop_btn.setIconSize(QSize(13, 13))
         self._stop_btn.setEnabled(False)
         self._stop_btn.setMinimumHeight(38)
         self._stop_btn.clicked.connect(self.stop_all_audio)
 
         self._stop_hotkey_btn = HotkeyCaptureButton(stop_hk, allow_empty=True)
+        self._stop_hotkey_btn.setMinimumHeight(34)
         self._stop_hotkey_btn.hotkey_changed.connect(self._on_stop_hotkey_changed)
 
         self._clip_hk_lbl = QLabel(t("main.clip_hk_label"))
+        self._clip_hk_lbl.setStyleSheet("color: #848a94; font-size: 12px; font-weight: 600;")
         self._stop_hk_lbl = QLabel(t("main.stop_hk_label"))
+        self._stop_hk_lbl.setStyleSheet("color: #848a94; font-size: 12px; font-weight: 600;")
         cap_lay.addWidget(self._capture_btn, 1)
         cap_lay.addWidget(self._clip_hk_lbl)
         cap_lay.addWidget(self._cap_hotkey_btn)
@@ -2999,6 +3359,13 @@ class MainWindow(QMainWindow):
         cap_lay.addWidget(self._stop_btn)
         cap_lay.addWidget(self._stop_hk_lbl)
         cap_lay.addWidget(self._stop_hotkey_btn)
+        cap_outer.addLayout(cap_lay)
+
+        self._telemetry_strip = _OledTelemetryStrip()
+        self._telemetry_strip.update_telemetry(
+            buf_s, int(getattr(self._ring, "sample_rate", 48000)), False
+        )
+        cap_outer.addWidget(self._telemetry_strip)
         root.addWidget(cap_card)
 
         # Collapsible Audio & Capture Settings Toggle Bar
@@ -3006,6 +3373,8 @@ class MainWindow(QMainWindow):
         toggle_row.setContentsMargins(0, 0, 0, 0)
         self._setup_toggle_btn = QPushButton(t("main.setup_toggle_expanded"))
         self._setup_toggle_btn.setObjectName("SectionToggle")
+        self._setup_toggle_btn.setIcon(_svg_icon("chevron_down", "#848a94", 13))
+        self._setup_toggle_btn.setIconSize(QSize(13, 13))
         self._setup_toggle_btn.setCheckable(True)
         self._setup_toggle_btn.setChecked(True)
         self._setup_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3020,12 +3389,12 @@ class MainWindow(QMainWindow):
         setup_lay.setContentsMargins(0, 0, 0, 0)
         setup_lay.setSpacing(10)
 
-        # Microphone, Direct Mic APO & Dual Volume Mixer
+        # Microphone, Direct Mic APO & Dual Hardware Fader Mixer
         ctrl_card = QFrame()
         ctrl_card.setObjectName("Card")
         ctrl_outer = QVBoxLayout(ctrl_card)
         ctrl_outer.setContentsMargins(12, 10, 12, 10)
-        ctrl_outer.setSpacing(8)
+        ctrl_outer.setSpacing(10)
 
         mic_row = QHBoxLayout()
         mic_row.setSpacing(8)
@@ -3041,9 +3410,11 @@ class MainWindow(QMainWindow):
             self._mic_combo.setCurrentIndex(1)
         self._mic_combo.currentIndexChanged.connect(self._on_settings_changed)
 
-        self._refresh_dev_btn = QPushButton("↻")
+        self._refresh_dev_btn = QPushButton("")
+        self._refresh_dev_btn.setIcon(_svg_icon("refresh", "#f2f3f5", 14))
+        self._refresh_dev_btn.setIconSize(QSize(14, 14))
         self._refresh_dev_btn.setToolTip(t("main.refresh_devices_tooltip"))
-        self._refresh_dev_btn.setMinimumWidth(34)
+        self._refresh_dev_btn.setFixedWidth(36)
         self._refresh_dev_btn.clicked.connect(self._start_device_scan)
 
         self._apo_btn = QPushButton(t("main.enable_direct_mic"))
@@ -3051,14 +3422,23 @@ class MainWindow(QMainWindow):
         self._apo_btn.clicked.connect(self._on_toggle_apo)
 
         self._mic_lbl = QLabel(t("main.mic_label"))
+        self._mic_lbl.setStyleSheet("color: #b4b9c2; font-weight: 600;")
         mic_row.addWidget(self._mic_lbl)
         mic_row.addWidget(self._mic_combo, 1)
         mic_row.addWidget(self._refresh_dev_btn)
         mic_row.addWidget(self._apo_btn)
         ctrl_outer.addLayout(mic_row)
 
-        mix_row = QHBoxLayout()
-        mix_row.setSpacing(8)
+        mic_divider = QFrame()
+        mic_divider.setObjectName("Divider")
+        ctrl_outer.addWidget(mic_divider)
+
+        mix_grid = QGridLayout()
+        mix_grid.setContentsMargins(0, 0, 0, 0)
+        mix_grid.setHorizontalSpacing(18)
+        mix_grid.setVerticalSpacing(4)
+        mix_grid.setColumnStretch(0, 1)
+        mix_grid.setColumnStretch(1, 1)
 
         mic_vol_pct = int(round(float(self._config.get("mic_volume", 1.0)) * 100))
         self._mic_vol_slider = QSlider(Qt.Orientation.Horizontal)
@@ -3069,9 +3449,19 @@ class MainWindow(QMainWindow):
         self._mic_vol_slider.valueChanged.connect(self._on_settings_changed)
 
         self._mic_vol_lbl = QLabel(ltr(f"{mic_vol_pct}%"))
-        self._mic_vol_lbl.setMinimumWidth(40)
-        self._mic_vol_lbl.setStyleSheet("color: #9A9AA2; font-size: 11px;")
+        self._mic_vol_lbl.setStyleSheet(
+            f"color: #b4b9c2; font-family: {_MONO_FONT}; font-size: 11px; font-weight: 600;"
+        )
         self._mic_vol_lbl.setToolTip(self._mic_vol_slider.toolTip())
+
+        self._mic_vol_title_lbl = QLabel(t("main.mic_vol_label"))
+        self._mic_vol_title_lbl.setStyleSheet("color: #b4b9c2; font-size: 12px; font-weight: 600;")
+
+        mic_fader_hdr = QHBoxLayout()
+        mic_fader_hdr.setContentsMargins(0, 0, 0, 0)
+        mic_fader_hdr.addWidget(self._mic_vol_title_lbl)
+        mic_fader_hdr.addStretch()
+        mic_fader_hdr.addWidget(self._mic_vol_lbl)
 
         self._monitor_chk = QCheckBox(t("main.monitor_chk"))
         self._monitor_chk.setToolTip(t("main.monitor_chk_tooltip"))
@@ -3088,19 +3478,22 @@ class MainWindow(QMainWindow):
         self._vol_slider.valueChanged.connect(self._on_settings_changed)
 
         self._vol_lbl = QLabel(ltr(f"{vol_pct}%"))
-        self._vol_lbl.setMinimumWidth(40)
-        self._vol_lbl.setStyleSheet("color: #9A9AA2; font-size: 11px;")
+        self._vol_lbl.setStyleSheet(
+            f"color: #b4b9c2; font-family: {_MONO_FONT}; font-size: 11px; font-weight: 600;"
+        )
         self._vol_lbl.setToolTip(self._vol_slider.toolTip())
 
-        self._mic_vol_title_lbl = QLabel(t("main.mic_vol_label"))
-        mix_row.addWidget(self._mic_vol_title_lbl)
-        mix_row.addWidget(self._mic_vol_slider, 1)
-        mix_row.addWidget(self._mic_vol_lbl)
-        mix_row.addSpacing(10)
-        mix_row.addWidget(self._monitor_chk)
-        mix_row.addWidget(self._vol_slider, 1)
-        mix_row.addWidget(self._vol_lbl)
-        ctrl_outer.addLayout(mix_row)
+        mon_fader_hdr = QHBoxLayout()
+        mon_fader_hdr.setContentsMargins(0, 0, 0, 0)
+        mon_fader_hdr.addWidget(self._monitor_chk)
+        mon_fader_hdr.addStretch()
+        mon_fader_hdr.addWidget(self._vol_lbl)
+
+        mix_grid.addLayout(mic_fader_hdr, 0, 0)
+        mix_grid.addWidget(self._mic_vol_slider, 1, 0)
+        mix_grid.addLayout(mon_fader_hdr, 0, 1)
+        mix_grid.addWidget(self._vol_slider, 1, 1)
+        ctrl_outer.addLayout(mix_grid)
         setup_lay.addWidget(ctrl_card)
 
         # Listening Source & Buffer Duration
@@ -3123,16 +3516,24 @@ class MainWindow(QMainWindow):
         self._loopback_combo.currentIndexChanged.connect(self._on_loopback_changed)
 
         self._capture_lbl = QLabel(t("main.capture_label"))
+        self._capture_lbl.setStyleSheet("color: #b4b9c2; font-weight: 600;")
         listen_row.addWidget(self._capture_lbl)
         listen_row.addWidget(self._loopback_combo, 1)
         listen_outer.addLayout(listen_row)
 
-        # Rolling buffer duration selector (presets + custom 5–180s spinbox)
+        # Rolling buffer duration selector (recessed segmented control + compact stepper)
         buf_row = QHBoxLayout()
         buf_row.setSpacing(8)
         self._buf_lbl = QLabel(t("main.buffer_label"))
-        self._buf_lbl.setStyleSheet("color: #9CA3AF; font-size: 13px;")
+        self._buf_lbl.setStyleSheet("color: #b4b9c2; font-size: 13px; font-weight: 600;")
         buf_row.addWidget(self._buf_lbl)
+
+        seg_frame = QFrame()
+        seg_frame.setObjectName("SegmentedControl")
+        seg_lay = QHBoxLayout(seg_frame)
+        seg_lay.setContentsMargins(3, 3, 3, 3)
+        seg_lay.setSpacing(2)
+
         self._buf_preset_btns: dict[int, QPushButton] = {}
         for sec in self._BUFFER_PRESETS:
             pbtn = QPushButton(t("main.buffer_preset", n=sec))
@@ -3142,26 +3543,41 @@ class MainWindow(QMainWindow):
             pbtn.setToolTip(t("main.buffer_preset_tooltip", n=sec))
             pbtn.clicked.connect(lambda _=False, s=sec: self._on_buffer_seconds_changed(s))
             self._buf_preset_btns[sec] = pbtn
-            buf_row.addWidget(pbtn)
+            seg_lay.addWidget(pbtn)
+        buf_row.addWidget(seg_frame)
 
         self._buf_spin = QSpinBox()
+        self._buf_spin.setButtonSymbols(QSpinBox.ButtonSymbols.PlusMinus)
         self._buf_spin.setRange(MIN_BUFFER_SECONDS, MAX_BUFFER_SECONDS)
         self._buf_spin.setValue(buf_s)
         self._buf_spin.setSuffix(t("main.buffer_spin_suffix"))
-        self._buf_spin.setFixedWidth(82)
-        self._buf_spin.setMinimumHeight(28)
+        self._buf_spin.setFixedWidth(84)
+        self._buf_spin.setMinimumHeight(30)
         self._buf_spin.setKeyboardTracking(False)
         self._buf_spin.setToolTip(t("main.buffer_spin_tooltip", min=MIN_BUFFER_SECONDS, max=MAX_BUFFER_SECONDS))
         self._buf_spin.valueChanged.connect(self._on_buffer_seconds_changed)
-        buf_row.addSpacing(2)
         buf_row.addWidget(self._buf_spin)
         buf_row.addStretch()
         listen_outer.addLayout(buf_row)
 
+        # Recessed OLED listening readout box
+        self._listen_oled = QFrame()
+        self._listen_oled.setObjectName("OledReadout")
+        oled_lay = QHBoxLayout(self._listen_oled)
+        oled_lay.setContentsMargins(10, 6, 10, 6)
+        oled_lay.setSpacing(8)
+        self._listen_dot = QFrame()
+        self._listen_dot.setFixedSize(6, 6)
+        self._listen_dot.setStyleSheet("background-color: #65d692; border-radius: 2px; border: none;")
         self._listening_label = QLabel(t("main.listening_checking"))
         self._listening_label.setAlignment(_text_align())
-        self._listening_label.setStyleSheet("color: #9CA3AF; font-size: 12px;")
-        listen_outer.addWidget(self._listening_label)
+        self._listening_label.setStyleSheet(
+            f"color: #65d692; font-family: {_MONO_FONT}; font-size: 11px; font-weight: 500;"
+        )
+        oled_lay.addWidget(self._listen_dot)
+        oled_lay.addWidget(self._listening_label, 1)
+        listen_outer.addWidget(self._listen_oled)
+
         setup_lay.addWidget(listen_card)
         root.addWidget(self._setup_section)
 
@@ -3176,9 +3592,9 @@ class MainWindow(QMainWindow):
         list_hdr = QHBoxLayout()
         self._saved_clips_lbl = QLabel(t("main.saved_clips_header"))
         self._saved_clips_lbl.setAlignment(_text_align())
-        self._saved_clips_lbl.setStyleSheet("font-size: 14px; font-weight: 700; color: #D1D5DB;")
+        self._saved_clips_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #f2f3f5; letter-spacing: 0.3px;")
         self._count_lbl = QLabel()
-        self._count_lbl.setStyleSheet("color: #6B7280; font-size: 12px;")
+        self._count_lbl.setStyleSheet(f"color: #848a94; font-family: {_MONO_FONT}; font-size: 11px;")
         list_hdr.addWidget(self._saved_clips_lbl)
         list_hdr.addStretch()
         list_hdr.addWidget(self._count_lbl)
@@ -3187,6 +3603,7 @@ class MainWindow(QMainWindow):
         # Saved Clips Scroll List
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list_host = QWidget()
         self._list_layout = QVBoxLayout(self._list_host)
         self._list_layout.setContentsMargins(0, 0, 4, 0)
@@ -3195,9 +3612,23 @@ class MainWindow(QMainWindow):
         self._scroll.setWidget(self._list_host)
         root.addWidget(self._scroll, 1)
 
-        # Compact Tray Preferences & Live Status Footer
+        # Hardware Footer Strip (#202226 with 1px #191b1e top border)
+        footer_strip = QFrame()
+        footer_strip.setObjectName("FooterStrip")
+        footer_outer = QHBoxLayout(footer_strip)
+        footer_outer.setContentsMargins(0, 0, 0, 0)
+        footer_outer.setSpacing(0)
+
+        footer_inner_w = QWidget()
+        footer_inner_w.setStyleSheet("background: transparent;")
+        footer_inner_w.setMaximumWidth(920)
+        footer_inner_w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        footer_v = QVBoxLayout(footer_inner_w)
+        footer_v.setContentsMargins(18, 8, 18, 8)
+        footer_v.setSpacing(5)
+
         footer_row = QHBoxLayout()
-        footer_row.setSpacing(14)
+        footer_row.setSpacing(16)
         self._startup_chk = QCheckBox(t("main.startup_chk"))
         self._startup_chk.setToolTip(t("main.startup_tooltip"))
         self._startup_chk.setChecked(paths.is_startup_enabled())
@@ -3211,14 +3642,17 @@ class MainWindow(QMainWindow):
         footer_row.addWidget(self._startup_chk)
         footer_row.addWidget(self._tray_close_chk)
         footer_row.addStretch()
-        root.addLayout(footer_row)
+        footer_v.addLayout(footer_row)
 
         self._status_bar_lbl = QLabel("")
         self._status_bar_lbl.setAlignment(_text_align())
-        self._status_bar_lbl.setStyleSheet(
-            "color: #8B8B96; font-size: 11px; padding-top: 2px; border-top: 1px solid #1E1E24;"
-        )
-        root.addWidget(self._status_bar_lbl)
+        self._status_bar_lbl.setStyleSheet(f"color: #848a94; font-family: {_MONO_FONT}; font-size: 11px;")
+        footer_v.addWidget(self._status_bar_lbl)
+
+        footer_outer.addStretch(0)
+        footer_outer.addWidget(footer_inner_w, 1)
+        footer_outer.addStretch(0)
+        central_v.addWidget(footer_strip)
 
         self.capture_requested.connect(self.capture_last_30s)
         self.play_clip_requested.connect(self.play_clip_by_id)
@@ -3245,11 +3679,17 @@ class MainWindow(QMainWindow):
         self.retranslate_ui()
         self.language_changed.emit(new_lang)
 
+    def _update_setup_toggle_icon(self) -> None:
+        expanded = self._setup_toggle_btn.isChecked()
+        icon_name = "chevron_down" if expanded else ("chevron_left" if is_rtl() else "chevron_right")
+        self._setup_toggle_btn.setIcon(_svg_icon(icon_name, "#848a94", 13))
+
     def _on_setup_section_toggled(self, expanded: bool) -> None:
         self._setup_section.setVisible(bool(expanded))
         self._setup_toggle_btn.setText(
             t("main.setup_toggle_expanded") if expanded else t("main.setup_toggle_collapsed")
         )
+        self._update_setup_toggle_icon()
 
     def _default_mic_item_text(self) -> str:
         if not self._devices_scanned:
@@ -3280,6 +3720,7 @@ class MainWindow(QMainWindow):
             if self._setup_toggle_btn.isChecked()
             else t("main.setup_toggle_collapsed")
         )
+        self._update_setup_toggle_icon()
         self._setup_toggle_btn.setToolTip(t("main.setup_toggle_tooltip"))
 
         self._mic_lbl.setText(t("main.mic_label"))
@@ -3483,6 +3924,11 @@ class MainWindow(QMainWindow):
             self._capture_btn.setText(t("main.clip_last_no_hk", n=secs))
         self._capture_btn.setToolTip(t("main.clip_last_tooltip", n=secs))
         self._cap_hotkey_btn.setToolTip(t("main.clip_hk_tooltip", n=secs))
+        self._telemetry_strip.update_telemetry(
+            secs,
+            int(getattr(self._ring, "sample_rate", 48000)),
+            bool(self._ring.is_running and self._ring.is_receiving_audio()),
+        )
         self._refresh_listening()
         if not self._clips:
             self._rebuild_clip_list()
@@ -3615,10 +4061,8 @@ class MainWindow(QMainWindow):
     def _set_status_message(self, message: str, *, hold_ms: int = 3500, is_error: bool = False) -> None:
         """Display a transient status bar message protected from background _refresh_status() overwrites."""
         self._status_override_until = time.monotonic() + max(0.0, hold_ms / 1000.0)
-        color = "#D48E95" if is_error else "#D4D4D8"
-        self._status_bar_lbl.setStyleSheet(
-            f"color: {color}; font-size: 11px; padding-top: 2px; border-top: 1px solid #1E1E24;"
-        )
+        color = "#f28c8c" if is_error else "#f2f3f5"
+        self._status_bar_lbl.setStyleSheet(f"color: {color}; font-family: {_MONO_FONT}; font-size: 11px;")
         self._status_bar_lbl.setText(message)
         if hold_ms > 0:
             self._status_restore_timer.start(hold_ms)
@@ -3629,9 +4073,7 @@ class MainWindow(QMainWindow):
         if time.monotonic() < self._status_override_until - 0.01:
             return
         self._status_override_until = 0.0
-        self._status_bar_lbl.setStyleSheet(
-            "color: #8B8B96; font-size: 11px; padding-top: 2px; border-top: 1px solid #1E1E24;"
-        )
+        self._status_bar_lbl.setStyleSheet(f"color: #848a94; font-family: {_MONO_FONT}; font-size: 11px;")
         self._refresh_status()
 
     def _repolish_widget(self, w: QWidget) -> None:
@@ -3648,14 +4090,17 @@ class MainWindow(QMainWindow):
                 is_mic = cid == active_id and active_mode == "mic"
                 is_loop = cid == active_id and active_mode == "loop"
                 prev_btn.setText(t("common.stop") if is_prev else t("main.clip_preview_btn"))
+                prev_btn.setIcon(_svg_icon("stop", "#f28c8c", 13) if is_prev else _svg_icon("speaker", "#f2f3f5", 13))
                 prev_btn.setObjectName("Danger" if is_prev else "")
                 self._repolish_widget(prev_btn)
 
                 mic_btn.setText(t("common.stop") if is_mic else t("main.clip_play_btn"))
+                mic_btn.setIcon(_svg_icon("stop", "#f28c8c", 13) if is_mic else _svg_icon("mic", "#65d692", 13))
                 mic_btn.setObjectName("Danger" if is_mic else "Accent")
                 self._repolish_widget(mic_btn)
 
                 loop_btn.setText(t("common.stop") if is_loop else t("main.clip_loop_btn"))
+                loop_btn.setIcon(_svg_icon("stop", "#f28c8c", 13) if is_loop else _svg_icon("loop", "#f2f3f5", 13))
                 loop_btn.setObjectName("Danger" if is_loop else "")
                 self._repolish_widget(loop_btn)
             except RuntimeError:
@@ -3664,6 +4109,7 @@ class MainWindow(QMainWindow):
         is_active = active_id is not None
         self._stop_btn.setEnabled(is_active)
         self._stop_btn.setObjectName("Danger" if is_active else "StopIdle")
+        self._stop_btn.setIcon(_svg_icon("stop", "#f28c8c" if is_active else "#848a94", 13))
         self._repolish_widget(self._stop_btn)
 
     def _stop_other_dialog_playback(self) -> None:
@@ -3710,9 +4156,7 @@ class MainWindow(QMainWindow):
         self._sync_clip_playback_buttons()
         self._status_override_until = 0.0
         self._status_restore_timer.stop()
-        self._status_bar_lbl.setStyleSheet(
-            "color: #8B8B96; font-size: 11px; padding-top: 2px; border-top: 1px solid #1E1E24;"
-        )
+        self._status_bar_lbl.setStyleSheet(f"color: #848a94; font-family: {_MONO_FONT}; font-size: 11px;")
         self._refresh_status()
 
     def _on_startup_toggled(self, checked: bool) -> None:
@@ -3740,14 +4184,20 @@ class MainWindow(QMainWindow):
         self._refresh_listening()
 
     def _refresh_listening(self) -> None:
+        secs = self._buffer_seconds()
+        sr = int(getattr(self._ring, "sample_rate", 48000))
         if self._ring.is_reconnecting:
             detail = f" ({self._ring.last_error})" if self._ring.last_error else ""
             self._listening_label.setText(t("main.listening_reconnecting", detail=detail))
-            self._listening_label.setStyleSheet("color: #FBBF24; font-size: 12px;")
+            self._listening_label.setStyleSheet(f"color: #fbbf24; font-family: {_MONO_FONT}; font-size: 11px;")
+            self._listen_dot.setStyleSheet("background-color: #fbbf24; border-radius: 2px; border: none;")
+            self._telemetry_strip.update_telemetry(secs, sr, False)
             return
         if not self._ring.is_running:
             self._listening_label.setText(t("main.listening_stopped"))
-            self._listening_label.setStyleSheet("color: #D48E95; font-size: 12px;")
+            self._listening_label.setStyleSheet(f"color: #f28c8c; font-family: {_MONO_FONT}; font-size: 11px;")
+            self._listen_dot.setStyleSheet("background-color: #f28c8c; border-radius: 2px; border: none;")
+            self._telemetry_strip.update_telemetry(secs, sr, False)
             return
         apps = self._ring.refresh_active_sessions()
         raw_dev = (self._ring.device_name or "").replace(" [Loopback]", "")
@@ -3756,18 +4206,19 @@ class MainWindow(QMainWindow):
         else:
             dev_short = raw_dev or t("main.loopback_default")
         active_now = self._ring.is_receiving_audio()
-        dot = "●" if active_now else "○"
-        color = "#89C2A4" if active_now else "#9CA3AF"
+        self._telemetry_strip.update_telemetry(secs, sr, active_now)
+        color = "#65d692" if active_now else "#65d692"
+        dot_color = "#65d692" if active_now else "#2a4735"
         apps_txt = ", ".join(apps[:5]) if apps else t("main.listening_waiting")
-        secs = self._buffer_seconds()
         mic_tag = (
             t("main.mic_buf_on", n=secs)
             if getattr(self._ring, "mic_active", False)
             else t("main.mic_buf_unavailable")
         )
         mode_tag = t("main.mode_per_app_outputs") if getattr(self._ring, "mode", "") == "procloop" else dev_short
-        self._listening_label.setText(t("main.listening_line", dot=dot, apps=apps_txt, mode=mode_tag, mic=mic_tag))
-        self._listening_label.setStyleSheet(f"color: {color}; font-size: 12px;")
+        self._listening_label.setText(t("main.listening_line", dot="", apps=apps_txt, mode=mode_tag, mic=mic_tag))
+        self._listening_label.setStyleSheet(f"color: {color}; font-family: {_MONO_FONT}; font-size: 11px;")
+        self._listen_dot.setStyleSheet(f"background-color: {dot_color}; border-radius: 2px; border: none;")
 
     def _current_mic_guid(self) -> Optional[str]:
         return self._mic_guids.get(self._mic_combo.currentData())
@@ -3784,22 +4235,28 @@ class MainWindow(QMainWindow):
         enh_off = bool(st.get("enhancements_disabled"))
         if enh_off:
             self._status_pill.setText(t("main.status_pill", buf_state=buf_state, mode_state=t("main.enhancements_off")))
-            self._status_pill.setToolTip(t("main.enhancements_off_tooltip"))
-            self._status_pill.setStyleSheet(
-                "background: #3B2711; color: #FBBF24; border: 1px solid #6B441A; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
+            self._status_badge.setToolTip(t("main.enhancements_off_tooltip"))
+            self._status_badge.setStyleSheet(
+                "QFrame#StatusBadge { background-color: #2b2112; border: 1px solid #6b4c1a; border-radius: 5px; }"
             )
+            self._status_dot.setStyleSheet("background-color: #fbbf24; border-radius: 2px; border: none;")
+            self._status_pill.setStyleSheet("color: #fbbf24; font-size: 11px; font-weight: 600;")
         else:
             apo_label = t("main.apo_active") if self._injector.apo_installed else t("main.apo_preview_mode")
             self._status_pill.setText(t("main.status_pill", buf_state=buf_state, mode_state=apo_label))
-            self._status_pill.setToolTip("")
+            self._status_badge.setToolTip("")
             if self._injector.apo_installed:
-                self._status_pill.setStyleSheet(
-                    "background: #18231F; color: #89C2A4; border: 1px solid #2A4037; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
+                self._status_badge.setStyleSheet(
+                    "QFrame#StatusBadge { background-color: #121a15; border: 1px solid #2a4735; border-radius: 5px; }"
                 )
+                self._status_dot.setStyleSheet("background-color: #65d692; border-radius: 2px; border: none;")
+                self._status_pill.setStyleSheet("color: #65d692; font-size: 11px; font-weight: 600;")
             else:
-                self._status_pill.setStyleSheet(
-                    "background: #1C1C21; color: #A1A1AA; border: 1px solid #2C2C34; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;"
+                self._status_badge.setStyleSheet(
+                    "QFrame#StatusBadge { background-color: #202226; border: 1px solid #4d525c; border-radius: 5px; }"
                 )
+                self._status_dot.setStyleSheet("background-color: #848a94; border-radius: 2px; border: none;")
+                self._status_pill.setStyleSheet("color: #b4b9c2; font-size: 11px; font-weight: 600;")
 
         if self._injector.apo_installed:
             self._apo_btn.setText(t("main.restore_mic"))
@@ -3829,9 +4286,7 @@ class MainWindow(QMainWindow):
         if enh_off:
             mode_lbl = t("main.enhancements_off")
         if time.monotonic() >= self._status_override_until:
-            self._status_bar_lbl.setStyleSheet(
-                "color: #8B8B96; font-size: 11px; padding-top: 2px; border-top: 1px solid #1E1E24;"
-            )
+            self._status_bar_lbl.setStyleSheet(f"color: #848a94; font-family: {_MONO_FONT}; font-size: 11px;")
             self._status_bar_lbl.setText(t("main.status_bar", buf_state=buf_state, device=cap_dev, mic=mic_label, mode=mode_lbl))
 
     def restore_all_mics_action(self) -> None:
@@ -3978,8 +4433,8 @@ class MainWindow(QMainWindow):
         )
         toast.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         toast.setStyleSheet(
-            "background-color: #18181C; color: #F4F4F5; border: 1px solid #3F3F4A; "
-            "border-radius: 8px; padding: 10px 16px; font-size: 13px; font-weight: 600;"
+            "background-color: #141618; color: #f2f3f5; border: 1px solid #4d525c; "
+            "border-radius: 5px; padding: 10px 16px; font-size: 13px; font-weight: 600;"
         )
         toast.adjustSize()
         app = QApplication.instance()
@@ -4426,7 +4881,7 @@ class MainWindow(QMainWindow):
             empty_lay.setContentsMargins(24, 32, 24, 32)
             empty_lay.setSpacing(6)
             empty = QLabel(t("main.empty_clips", hk=ltr(cap_hk), n=secs))
-            empty.setStyleSheet("color: #8B8B96; font-size: 13px;")
+            empty.setStyleSheet("color: #848a94; font-size: 13px;")
             empty.setWordWrap(True)
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty_lay.addWidget(empty)
@@ -4443,6 +4898,8 @@ class MainWindow(QMainWindow):
 
             export_btn = QPushButton(t("main.clip_export_btn"))
             export_btn.setObjectName("ExportCard")
+            export_btn.setIcon(_svg_icon("download", "#b4b9c2", 13))
+            export_btn.setIconSize(QSize(13, 13))
             export_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
             export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             export_btn.setToolTip(t("main.clip_export_tooltip"))
@@ -4455,47 +4912,57 @@ class MainWindow(QMainWindow):
                 lambda pos, c=clip, w=card: self._show_clip_context_menu(w, pos, c)
             )
             row = QHBoxLayout(card)
-            row.setContentsMargins(12, 6, 12, 6)
-            row.setSpacing(8)
+            row.setContentsMargins(12, 7, 12, 7)
+            row.setSpacing(6)
 
             info = QVBoxLayout()
             info.setContentsMargins(0, 0, 0, 0)
-            info.setSpacing(1)
+            info.setSpacing(2)
             name_lbl = QLabel(clip.name)
             name_lbl.setAlignment(_text_align())
-            name_lbl.setStyleSheet("font-weight: 700; font-size: 13px; color: #F4F4F5;")
+            name_lbl.setStyleSheet("font-weight: 700; font-size: 13px; color: #f2f3f5;")
             preset_disp = localize_effect_name(None, clip.preset)
             meta_lbl = QLabel(t("main.clip_meta", dur=clip.duration, preset=preset_disp))
             meta_lbl.setAlignment(_text_align())
-            meta_lbl.setStyleSheet("color: #9A9AA2; font-size: 11px;")
+            meta_lbl.setStyleSheet(f"color: #b4b9c2; font-family: {_MONO_FONT}; font-size: 11px;")
             info.addWidget(name_lbl)
             info.addWidget(meta_lbl)
 
             hk_btn = HotkeyCaptureButton(clip.hotkey)
             hk_btn.setToolTip(t("main.clip_hk_tooltip"))
-            hk_btn.setMinimumWidth(86)
+            hk_btn.setMinimumWidth(78)
             hk_btn.hotkey_changed.connect(lambda hk, cid=clip.id: self._on_clip_hotkey_changed(cid, hk))
 
             preview_btn = QPushButton(t("main.clip_preview_btn"))
+            preview_btn.setIcon(_svg_icon("speaker", "#f2f3f5", 13))
+            preview_btn.setIconSize(QSize(13, 13))
             preview_btn.setToolTip(t("main.clip_preview_tooltip"))
             preview_btn.clicked.connect(lambda _=False, cid=clip.id: self.preview_clip_by_id(cid))
 
             play_btn = QPushButton(t("main.clip_play_btn"))
             play_btn.setObjectName("Accent")
+            play_btn.setIcon(_svg_icon("mic", "#65d692", 13))
+            play_btn.setIconSize(QSize(13, 13))
             play_btn.setToolTip(t("main.clip_play_tooltip"))
             play_btn.clicked.connect(lambda _=False, cid=clip.id: self.play_clip_by_id(cid))
 
             loop_btn = QPushButton(t("main.clip_loop_btn"))
+            loop_btn.setIcon(_svg_icon("loop", "#f2f3f5", 13))
+            loop_btn.setIconSize(QSize(13, 13))
             loop_btn.setToolTip(t("main.clip_loop_tooltip"))
             loop_btn.clicked.connect(lambda _=False, cid=clip.id: self.loop_clip_by_id(cid))
 
             edit_btn = QPushButton(t("main.clip_edit_btn"))
+            edit_btn.setIcon(_svg_icon("edit", "#f2f3f5", 13))
+            edit_btn.setIconSize(QSize(13, 13))
             edit_btn.setToolTip(t("main.clip_edit_tooltip"))
             edit_btn.clicked.connect(lambda _=False, c=clip: self._edit_clip(c))
 
-            del_btn = QPushButton("✕")
+            del_btn = QPushButton("")
             del_btn.setObjectName("Danger")
-            del_btn.setMinimumWidth(34)
+            del_btn.setIcon(_svg_icon("close", "#f28c8c", 13))
+            del_btn.setIconSize(QSize(13, 13))
+            del_btn.setFixedWidth(32)
             del_btn.setToolTip(t("main.clip_delete_tooltip"))
             del_btn.clicked.connect(lambda _=False, c=clip: self._delete_clip(c))
 

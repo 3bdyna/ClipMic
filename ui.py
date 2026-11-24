@@ -2068,6 +2068,7 @@ class TrimDialog(QDialog):
         self._worker: Optional[_RenderWorker] = None
         self._pending_key: Optional[tuple[int, int, str, str]] = None
         self._pending_then: Optional[Callable[[Path], None]] = None
+        self._queued_then: Optional[Callable[[Path], None]] = None
         self._effects: list[dict] = []
         self._current_effect_id = "normal"
 
@@ -2167,9 +2168,6 @@ class TrimDialog(QDialog):
         self._play_btn = QPushButton(t("trim.play_preview_btn"))
         self._play_btn.setToolTip(t("trim.play_preview_tooltip"))
         self._play_btn.clicked.connect(self._on_play_preview)
-        self._stop_btn = QPushButton(t("common.stop"))
-        self._stop_btn.setToolTip(t("trim.stop_tooltip"))
-        self._stop_btn.clicked.connect(self._on_stop)
         self._send_btn = QPushButton(t("trim.send_mic_btn"))
         self._send_btn.setObjectName("Accent")
         self._send_btn.setToolTip(t("trim.send_mic_tooltip"))
@@ -2178,7 +2176,6 @@ class TrimDialog(QDialog):
         self._status_lbl.setStyleSheet("color: #9CA3AF; font-size: 12px;")
 
         play_row.addWidget(self._play_btn)
-        play_row.addWidget(self._stop_btn)
         play_row.addWidget(self._send_btn)
         play_row.addSpacing(8)
         play_row.addWidget(self._status_lbl, 1)
@@ -2291,6 +2288,7 @@ class TrimDialog(QDialog):
         self._effect_combo.blockSignals(False)
         for eid, btn in self._preset_btns.items():
             btn.setChecked(eid == effect_id)
+        self._restart_preview()
 
     def _on_effect_combo_changed(self) -> None:
         eid = self._effect_combo.currentData()
@@ -2338,6 +2336,7 @@ class TrimDialog(QDialog):
             then(self._rendered_wav)
             return
         if self._worker_thread and self._worker_thread.isRunning():
+            self._queued_then = then
             return
 
         s, e = self._waveform.trim_range()
@@ -2374,10 +2373,15 @@ class TrimDialog(QDialog):
         self._worker = None
         then = self._pending_then
         key = self._pending_key
+        queued = self._queued_then
         self._pending_then = None
         self._pending_key = None
+        self._queued_then = None
         self._set_busy(False, "")
         if err:
+            if queued is not None:
+                self._ensure_rendered(queued)
+                return
             QMessageBox.warning(self, t("trim.err_ffmpeg_title"), err)
             return
         self._cache_key = key
@@ -2389,6 +2393,9 @@ class TrimDialog(QDialog):
                 prev_wav.unlink()
             except OSError:
                 pass
+        if queued is not None:
+            self._ensure_rendered(queued)
+            return
         if then is not None:
             then(self._rendered_wav)
 
@@ -2449,12 +2456,25 @@ class TrimDialog(QDialog):
         self._play_timer.stop()
         self._waveform.set_playhead(None)
 
+    def _sync_play_button(self) -> None:
+        if self._is_playing:
+            self._play_btn.setText(t("common.stop"))
+            self._play_btn.setToolTip(t("trim.stop_tooltip"))
+            self._play_btn.setObjectName("Danger")
+        else:
+            self._play_btn.setText(t("trim.play_preview_btn"))
+            self._play_btn.setToolTip(t("trim.play_preview_tooltip"))
+            self._play_btn.setObjectName("")
+        self._play_btn.style().unpolish(self._play_btn)
+        self._play_btn.style().polish(self._play_btn)
+
     def _on_playback_done(self, seq: int) -> None:
         if seq != self._play_seq:
             return
         self._is_playing = False
         self._is_preview_playing = False
         self._stop_playhead()
+        self._sync_play_button()
         self._status_lbl.setText("")
 
     def _play_preview_from(self, target_sec: float, *, start_timer: bool = True) -> None:
@@ -2466,6 +2486,7 @@ class TrimDialog(QDialog):
             seq = self._play_seq
             self._is_playing = True
             self._is_preview_playing = True
+            self._sync_play_button()
             self._status_lbl.setText(t("trim.status_playing"))
             self._start_playhead(wav, offset_s=offset, start_timer=start_timer)
             self._injector.play_wav(
@@ -2478,6 +2499,18 @@ class TrimDialog(QDialog):
             )
 
         self._ensure_rendered(play)
+
+    def _restart_preview(self) -> None:
+        if self._is_playing:
+            self._play_seq += 1
+            self._is_playing = False
+            self._is_preview_playing = False
+            self._scrub_was_playing = False
+            self._injector.stop()
+            self._stop_playhead()
+            self._sync_play_button()
+        start_s, _end_s = self._waveform.trim_range()
+        self._play_preview_from(start_s, start_timer=True)
 
     def _on_waveform_scrubbed(self, sec: float) -> None:
         self._play_timer.stop()
@@ -2496,6 +2529,9 @@ class TrimDialog(QDialog):
         self._play_preview_from(sec, start_timer=True)
 
     def _on_play_preview(self) -> None:
+        if self._is_playing:
+            self._on_stop()
+            return
         start_s, _end_s = self._waveform.trim_range()
         self._play_preview_from(start_s, start_timer=True)
 
@@ -2507,6 +2543,7 @@ class TrimDialog(QDialog):
             seq = self._play_seq
             self._is_playing = True
             self._is_preview_playing = False
+            self._sync_play_button()
             self._status_lbl.setText(mode)
             self._start_playhead(wav)
             self._injector.play_wav(
@@ -2524,11 +2561,13 @@ class TrimDialog(QDialog):
         self._play_seq += 1
         self._pending_then = None
         self._pending_key = None
+        self._queued_then = None
         self._is_playing = False
         self._is_preview_playing = False
         self._scrub_was_playing = False
         self._injector.stop()
         self._stop_playhead()
+        self._sync_play_button()
         self._status_lbl.setText(t("common.stopped"))
 
     def _on_save(self) -> None:

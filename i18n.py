@@ -106,11 +106,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "main.apo_status_enabling": "Enabling Direct Mic…",
         "main.apo_status_restoring": "Disabling Direct Mic…",
         "main.apo_uac_cancelled": "Direct Mic permission cancelled",
-        "main.mic_vol_label": "Mic Vol:",
-        "main.mic_vol_tooltip": "Mic send volume (how loud clips sound to teammates on Discord/games)",
-        "main.monitor_chk": "Monitor",
-        "main.monitor_chk_tooltip": "Hear clips locally in your headphones when playing to mic (uncheck to mute local monitor)",
-        "main.monitor_vol_tooltip": "Local monitor volume (how loud you hear clips; does not affect Discord/mic volume)",
+        "main.mic_vol_label": "Clip Mic Vol:",
+        "main.mic_vol_tooltip": "How loud clips sound to others through your mic (Discord/games)",
+        "main.monitor_chk": "Clip Headset Vol",
+        "main.monitor_chk_tooltip": "Hear clips in your own headset when playing to mic (uncheck to mute for yourself)",
+        "main.monitor_vol_tooltip": "How loud clips sound in your own headset (does not affect what others hear)",
 
         # MainWindow capture source & buffer
         "main.capture_label": "Capture:",
@@ -441,11 +441,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "main.apo_status_enabling": "جارٍ تفعيل المايك المباشر…",
         "main.apo_status_restoring": "جارٍ إيقاف المايك المباشر…",
         "main.apo_uac_cancelled": "تم إلغاء إذن المسؤول للمايك المباشر",
-        "main.mic_vol_label": "صوت المايك:",
-        "main.mic_vol_tooltip": "مستوى صوت المقاطع التي يسمعها الآخرون عبر المايك في ديسكورد والألعاب",
-        "main.monitor_chk": "سماع الصوت",
-        "main.monitor_chk_tooltip": "سماع المقاطع في سماعتك أثناء تشغيلها عبر المايك",
-        "main.monitor_vol_tooltip": "مستوى سماع المقاطع في سماعتك فقط (لا يؤثر على صوت المايك)",
+        "main.mic_vol_label": "صوت المقطع بالمايك:",
+        "main.mic_vol_tooltip": "مدى علو صوت المقطع الذي يسمعه الآخرون عبر المايك (في ديسكورد والألعاب)",
+        "main.monitor_chk": "صوت المقطع بالسماعة",
+        "main.monitor_chk_tooltip": "سماع المقطع في سماعتك أثناء تشغيله بالمايك (أزل التحديد لكتمه عنك فقط)",
+        "main.monitor_vol_tooltip": "مدى علو صوت المقطع في سماعتك فقط (لا يؤثر على ما يسمعه الآخرون)",
 
         # MainWindow capture source & buffer
         "main.capture_label": "مصدر الصوت:",

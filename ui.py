@@ -1212,7 +1212,7 @@ class _FastClipWorker(QObject):
                 self.finished.emit(None, "Empty audio")
                 return
 
-            actual_duration_s = float(len(audio_i16)) / float(sr)
+            raw_duration_s = float(len(audio_i16)) / float(sr)
             safe_slug = re.sub(r"[^A-Za-z0-9_-]+", "_", self.channel_label).strip("_") or "clip"
             dest = paths.clips_dir() / f"fast_{safe_slug[:24]}_{self.clip_id}.wav"
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1231,18 +1231,18 @@ class _FastClipWorker(QObject):
                     effects_list=effects_list,
                 )
 
-            dur_rounded = round(actual_duration_s, 2)
+            out_duration_s = probe_wav_duration(dest) if resolved_fx_id != "normal" else raw_duration_s
             entry = ClipEntry(
                 id=self.clip_id,
                 name=f"Fast {self.channel_label} {self.created_ts}",
                 file=str(dest.relative_to(paths.user_data_dir())),
                 hotkey="",
                 preset=fx_display_name,
-                duration=dur_rounded,
+                duration=round(out_duration_s, 2),
                 source_dir=f"clips/_sources/{self.clip_id}",
                 selected_keys=list(self.selected_keys),
                 trim_start=0.0,
-                trim_end=dur_rounded,
+                trim_end=round(raw_duration_s, 3),
                 effect_id=resolved_fx_id,
             )
             self.finished.emit(entry, "")
@@ -4275,9 +4275,11 @@ class MainWindow(QMainWindow):
     def _reload_fast_clip_effects(self) -> None:
         effects_list = load_effects()
         target_id = str(self._config.get("fast_clip_effect", "normal") or "normal")
+        fell_back = False
         if not any(fx["id"] == target_id for fx in effects_list):
             target_id = "normal"
             self._config["fast_clip_effect"] = "normal"
+            fell_back = True
         self._fast_fx_combo.blockSignals(True)
         self._fast_fx_combo.clear()
         for fx in effects_list:
@@ -4285,6 +4287,8 @@ class MainWindow(QMainWindow):
         idx = self._fast_fx_combo.findData(target_id)
         self._fast_fx_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._fast_fx_combo.blockSignals(False)
+        if fell_back:
+            self._on_save_state(self._config, self._clips)
 
     def _on_fast_clip_effect_changed(self, _idx: int) -> None:
         fx_id = str(self._fast_fx_combo.currentData() or "normal")
@@ -5146,12 +5150,15 @@ class MainWindow(QMainWindow):
     @Slot(object, str)
     def _on_fast_clip_finished(self, entry: Optional[ClipEntry], err: str) -> None:
         thread = self._fast_clip_thread
+        worker = self._fast_clip_worker
         self._fast_clip_thread = None
         self._fast_clip_worker = None
         if thread is not None:
             thread.quit()
             thread.wait(500)
             thread.deleteLater()
+        if worker is not None:
+            worker.deleteLater()
         self._fast_clip_busy = False
 
         if err or entry is None:

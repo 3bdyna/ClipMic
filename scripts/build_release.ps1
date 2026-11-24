@@ -135,6 +135,17 @@ function Stop-RunningClipMic {
     Start-Sleep -Milliseconds 300
 }
 
+function Start-ClipMicDetached {
+    $installedExe = Join-Path $env:LOCALAPPDATA "Programs\ClipMic\ClipMic.exe"
+    if (-not (Test-Path $installedExe)) {
+        throw "Installed executable not found at '$installedExe'."
+    }
+    $launch = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "`"$installedExe`"" }
+    if ($launch.ReturnValue -ne 0) {
+        throw "Failed to launch ClipMic detached (Win32_Process.Create ReturnValue=$($launch.ReturnValue))."
+    }
+}
+
 function Invoke-LocalInstall {
     param(
         [string]$InstallerPath,
@@ -147,13 +158,13 @@ function Invoke-LocalInstall {
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
         "/CLOSEAPPLICATIONS",
-        "/FORCECLOSEAPPLICATIONS",
-        "/RELAUNCH"
+        "/FORCECLOSEAPPLICATIONS"
     )
     $proc = Start-Process -FilePath $InstallerPath -ArgumentList $installerArgs -Wait -PassThru
     if ($proc.ExitCode -ne 0) {
         throw "Local installer failed with exit code $($proc.ExitCode)."
     }
+    Start-ClipMicDetached
     Write-Host "[InstallLocal] Local installed ClipMic updated to $Version and relaunched." -ForegroundColor Green
 }
 
@@ -245,9 +256,17 @@ try {
 
     # 4. Build PyInstaller one-folder bundle unless -SkipBuild
     $distAppDir = Join-Path $RepoRoot "dist\ClipMic"
+    $installDir = Join-Path $env:LOCALAPPDATA "Programs\ClipMic"
+    $installedExe = Join-Path $installDir "ClipMic.exe"
+    $isFastLocalSync = $InstallLocal -and (-not $Publish) -and (Test-Path $installedExe)
+
     if (-not $SkipBuild) {
+        $pyinstallerArgs = @("ClipMic.spec", "--noconfirm")
+        if (-not $isFastLocalSync) {
+            $pyinstallerArgs += "--clean"
+        }
         Write-Host "[4/7] Building PyInstaller bundle (ClipMic.spec)..." -ForegroundColor Cyan
-        Invoke-Native -FilePath "pyinstaller" -ArgumentList @("ClipMic.spec", "--noconfirm", "--clean") -FailureMessage "PyInstaller build failed"
+        Invoke-Native -FilePath "pyinstaller" -ArgumentList $pyinstallerArgs -FailureMessage "PyInstaller build failed"
     } else {
         Write-Host "[4/7] Skipping PyInstaller build (-SkipBuild)." -ForegroundColor Yellow
     }
@@ -261,6 +280,19 @@ try {
     Assert-BundledFile -DistRoot $distAppDir -RelPath "_ssl.pyd" -Label "Python TLS/SSL extension"
     Assert-BundledFile -DistRoot $distAppDir -RelPath "clipmic.ico" -Label "App icon"
     Write-Host "      Verified ClipMic.exe, native DLLs, ffmpeg.exe, and _ssl.pyd." -ForegroundColor Green
+
+    if ($isFastLocalSync) {
+        Write-Host ""
+        Write-Host "[InstallLocal] Fast-syncing dist\ClipMic -> $installDir (skipping Inno Setup)..." -ForegroundColor Cyan
+        Stop-RunningClipMic
+        & robocopy $distAppDir $installDir /MIR /R:2 /W:1 /NP /XF unins*
+        if ($LASTEXITCODE -ge 8) {
+            throw "robocopy failed with exit code $LASTEXITCODE."
+        }
+        Start-ClipMicDetached
+        Write-Host "[InstallLocal] Fast local sync complete ($version) and ClipMic relaunched." -ForegroundColor Green
+        return
+    }
 
     # 5. Locate Inno Setup 6 ISCC.exe
     Write-Host "[5/7] Locating Inno Setup 6 (ISCC.exe)..." -ForegroundColor Cyan

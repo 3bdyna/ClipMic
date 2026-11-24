@@ -169,9 +169,12 @@ QPushButton#ExportCard {
     color: #C8C8D0;
     border: 1px solid #22222A;
     border-radius: 10px;
-    padding: 8px 12px;
+    padding: 4px 10px;
     font-size: 12px;
     font-weight: 600;
+}
+QWidget#ClipRow QPushButton {
+    padding: 4px 10px;
 }
 QPushButton#ExportCard:hover {
     background-color: #1C1C22;
@@ -234,8 +237,8 @@ QPushButton#BufPresetBtn {
     background-color: #16161B;
     border: 1px solid #2A2A32;
     border-radius: 6px;
-    padding: 3px 8px;
-    font-size: 11px;
+    padding: 5px 12px;
+    font-size: 12px;
     font-weight: 600;
     color: #A1A1AA;
 }
@@ -3092,12 +3095,12 @@ class MainWindow(QMainWindow):
         ctrl_outer.addLayout(mix_row)
         setup_lay.addWidget(ctrl_card)
 
-        # Listening Source & Discord Toggle
+        # Listening Source & Buffer Duration
         listen_card = QFrame()
         listen_card.setObjectName("Card")
         listen_outer = QVBoxLayout(listen_card)
         listen_outer.setContentsMargins(12, 10, 12, 10)
-        listen_outer.setSpacing(6)
+        listen_outer.setSpacing(8)
 
         listen_row = QHBoxLayout()
         listen_row.setSpacing(8)
@@ -3111,26 +3114,16 @@ class MainWindow(QMainWindow):
             self._loopback_combo.setCurrentIndex(1)
         self._loopback_combo.currentIndexChanged.connect(self._on_loopback_changed)
 
-        self._discord_chk = QCheckBox(t("main.discord_chk"))
-        self._discord_chk.setChecked(bool(self._config.get("include_discord", True)))
-        self._discord_chk.toggled.connect(self._on_discord_toggled)
-
-        self._mic_buf_chk = QCheckBox()
-        self._mic_buf_chk.setChecked(bool(self._config.get("capture_mic_buffer", True)))
-        self._mic_buf_chk.toggled.connect(self._on_mic_buf_toggled)
-
         self._capture_lbl = QLabel(t("main.capture_label"))
         listen_row.addWidget(self._capture_lbl)
         listen_row.addWidget(self._loopback_combo, 1)
-        listen_row.addWidget(self._mic_buf_chk)
-        listen_row.addWidget(self._discord_chk)
         listen_outer.addLayout(listen_row)
 
-        # Compact rolling buffer duration selector (presets + custom 5–180s spinbox)
+        # Rolling buffer duration selector (presets + custom 5–180s spinbox)
         buf_row = QHBoxLayout()
-        buf_row.setSpacing(6)
+        buf_row.setSpacing(8)
         self._buf_lbl = QLabel(t("main.buffer_label"))
-        self._buf_lbl.setStyleSheet("color: #9CA3AF; font-size: 12px;")
+        self._buf_lbl.setStyleSheet("color: #9CA3AF; font-size: 13px;")
         buf_row.addWidget(self._buf_lbl)
         self._buf_preset_btns: dict[int, QPushButton] = {}
         for sec in self._BUFFER_PRESETS:
@@ -3147,7 +3140,8 @@ class MainWindow(QMainWindow):
         self._buf_spin.setRange(MIN_BUFFER_SECONDS, MAX_BUFFER_SECONDS)
         self._buf_spin.setValue(buf_s)
         self._buf_spin.setSuffix(t("main.buffer_spin_suffix"))
-        self._buf_spin.setFixedWidth(72)
+        self._buf_spin.setFixedWidth(82)
+        self._buf_spin.setMinimumHeight(28)
         self._buf_spin.setKeyboardTracking(False)
         self._buf_spin.setToolTip(t("main.buffer_spin_tooltip", min=MIN_BUFFER_SECONDS, max=MAX_BUFFER_SECONDS))
         self._buf_spin.valueChanged.connect(self._on_buffer_seconds_changed)
@@ -3300,7 +3294,6 @@ class MainWindow(QMainWindow):
         self._loopback_combo.setToolTip(t("main.loopback_tooltip"))
         if self._loopback_combo.count() > 0:
             self._loopback_combo.setItemText(0, t("main.loopback_default"))
-        self._discord_chk.setText(t("main.discord_chk"))
 
         self._buf_lbl.setText(t("main.buffer_label"))
         for sec, pbtn in self._buf_preset_btns.items():
@@ -3482,9 +3475,6 @@ class MainWindow(QMainWindow):
             self._capture_btn.setText(t("main.clip_last_no_hk", n=secs))
         self._capture_btn.setToolTip(t("main.clip_last_tooltip", n=secs))
         self._cap_hotkey_btn.setToolTip(t("main.clip_hk_tooltip", n=secs))
-        self._discord_chk.setToolTip(t("main.discord_tooltip", n=secs))
-        self._mic_buf_chk.setText(t("main.capture_mic_chk", n=secs))
-        self._mic_buf_chk.setToolTip(t("main.capture_mic_tooltip", n=secs, hk=ltr(cap_hk or "F9")))
         self._refresh_listening()
         if not self._clips:
             self._rebuild_clip_list()
@@ -3723,19 +3713,6 @@ class MainWindow(QMainWindow):
         self._config["minimize_to_tray"] = bool(checked)
         self._on_save_state(self._config, self._clips)
 
-    def _on_discord_toggled(self, checked: bool) -> None:
-        self._config["include_discord"] = bool(checked)
-        self._ring.set_include_discord(checked)
-        self._on_save_state(self._config, self._clips)
-        self._refresh_listening()
-
-    def _on_mic_buf_toggled(self, checked: bool) -> None:
-        self._config["capture_mic_buffer"] = bool(checked)
-        if hasattr(self._ring, "set_capture_mic_buffer"):
-            self._ring.set_capture_mic_buffer(checked)
-        self._on_save_state(self._config, self._clips)
-        self._refresh_listening()
-
     def _on_loopback_changed(self) -> None:
         dev = self._loopback_combo.currentData()
         self._config["loopback_device"] = dev
@@ -3763,24 +3740,15 @@ class MainWindow(QMainWindow):
             dev_short = t("main.mode_per_app_outputs")
         else:
             dev_short = raw_dev or t("main.loopback_default")
-        inc_discord = self._discord_chk.isChecked()
-        visible_apps = apps if inc_discord else [a for a in apps if a.lower() != "discord"]
-        discord_paused = (not inc_discord) and bool(apps) and not visible_apps
-
-        if discord_paused:
-            self._listening_label.setText(t("main.listening_discord_paused", device=dev_short))
-            self._listening_label.setStyleSheet("color: #FBBF24; font-size: 12px;")
-            return
-
         active_now = self._ring.is_receiving_audio()
         dot = "●" if active_now else "○"
         color = "#89C2A4" if active_now else "#9CA3AF"
-        apps_txt = ", ".join(visible_apps[:5]) if visible_apps else t("main.listening_waiting")
+        apps_txt = ", ".join(apps[:5]) if apps else t("main.listening_waiting")
         secs = self._buffer_seconds()
         mic_tag = (
             t("main.mic_buf_on", n=secs)
             if getattr(self._ring, "mic_active", False)
-            else (t("main.mic_buf_off", n=secs) if not self._mic_buf_chk.isChecked() else t("main.mic_buf_unavailable"))
+            else t("main.mic_buf_unavailable")
         )
         mode_tag = t("main.mode_per_app_outputs") if getattr(self._ring, "mode", "") == "procloop" else dev_short
         self._listening_label.setText(t("main.listening_line", dot=dot, apps=apps_txt, mode=mode_tag, mic=mic_tag))
@@ -4439,13 +4407,14 @@ class MainWindow(QMainWindow):
         for idx, clip in enumerate(self._clips):
             row_container = QWidget()
             row_container.setObjectName("ClipRow")
+            row_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             outer_row = QHBoxLayout(row_container)
             outer_row.setContentsMargins(0, 0, 0, 0)
             outer_row.setSpacing(8)
 
             export_btn = QPushButton(t("main.clip_export_btn"))
             export_btn.setObjectName("ExportCard")
-            export_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+            export_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
             export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             export_btn.setToolTip(t("main.clip_export_tooltip"))
             export_btn.clicked.connect(lambda _=False, c=clip: self._export_clip_mp3(c))
@@ -4457,11 +4426,12 @@ class MainWindow(QMainWindow):
                 lambda pos, c=clip, w=card: self._show_clip_context_menu(w, pos, c)
             )
             row = QHBoxLayout(card)
-            row.setContentsMargins(12, 10, 12, 10)
+            row.setContentsMargins(12, 6, 12, 6)
             row.setSpacing(8)
 
             info = QVBoxLayout()
-            info.setSpacing(2)
+            info.setContentsMargins(0, 0, 0, 0)
+            info.setSpacing(1)
             name_lbl = QLabel(clip.name)
             name_lbl.setAlignment(_text_align())
             name_lbl.setStyleSheet("font-weight: 700; font-size: 13px; color: #F4F4F5;")

@@ -6,7 +6,7 @@
 
 **Windows soundboard, rolling per-app audio clipper, and Direct Mic APO audio injector — no virtual audio cable needed.**
 
-> **Honest Note:** I am not a professional programmer—I mostly vibe-coded ClipMic with AI because I wanted a clean, lightweight Windows soundboard and audio clipper that injects directly into my microphone without messing with virtual audio cables. Expect occasional quirks, and bug reports or PRs are very welcome!
+> **Note:** I am not a professional programmer I vibe-coded ClipMic with AI because I wanted a clean, lightweight Windows soundboard and audio clipper that injects directly into my microphone without messing with virtual audio cables. Expect the features that totally are NOT bugs.
 
 ---
 

@@ -12,7 +12,7 @@ from typing import Callable, Optional
 
 import numpy as np
 from PySide6.QtCore import QByteArray, QEvent, QObject, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache
+from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
@@ -730,6 +730,31 @@ def make_app_icon() -> QIcon:
         p.drawRoundedRect(x, y, 5, h, 2, 2)
     p.end()
     return QIcon(pm)
+
+
+def make_app_logo_pixmap(height: int = 18, dpr: float = 2.0) -> QPixmap:
+    """Render the bundled app icon tightly cropped to its opaque bounds for crisp header display."""
+    img = make_app_icon().pixmap(QSize(256, 256)).toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+    w, h = img.width(), img.height()
+    min_x, min_y, max_x, max_y = w, h, -1, -1
+    for y in range(h):
+        for x in range(w):
+            if img.pixelColor(x, y).alpha() > 8:
+                if x < min_x:
+                    min_x = x
+                if x > max_x:
+                    max_x = x
+                if y < min_y:
+                    min_y = y
+                if y > max_y:
+                    max_y = y
+    if max_x >= min_x and max_y >= min_y:
+        img = img.copy(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+    target_h = max(1, int(round(height * dpr)))
+    scaled = img.scaledToHeight(target_h, Qt.TransformationMode.SmoothTransformation)
+    pm = QPixmap.fromImage(scaled)
+    pm.setDevicePixelRatio(dpr)
+    return pm
 
 
 class HotkeyCaptureButton(QPushButton):
@@ -3279,6 +3304,9 @@ class MainWindow(QMainWindow):
         # Header & Live Status Badge
         top = QHBoxLayout()
         top.setSpacing(8)
+        brand_logo = QLabel()
+        brand_logo.setPixmap(make_app_logo_pixmap(18, max(2.0, self.devicePixelRatioF())))
+        brand_logo.setStyleSheet("background: transparent; border: none;")
         brand = QLabel(t("app.title"))
         brand.setStyleSheet("font-size: 20px; font-weight: 800; color: #f2f3f5; letter-spacing: -0.3px;")
 
@@ -3295,6 +3323,7 @@ class MainWindow(QMainWindow):
         badge_lay.addWidget(self._status_dot)
         badge_lay.addWidget(self._status_pill)
 
+        top.addWidget(brand_logo)
         top.addWidget(brand)
         top.addSpacing(4)
         top.addWidget(self._status_badge)

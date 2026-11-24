@@ -310,6 +310,7 @@ class MicInjector:
         send_to_mic: bool = False,
         monitor_enabled: bool = True,
         start_sec: float = 0.0,
+        loop: bool = False,
         on_done: Optional[Callable[[], None]] = None,
     ) -> bool:
         data, sr = read_wav(wav_path)
@@ -321,6 +322,7 @@ class MicInjector:
             send_to_mic=send_to_mic,
             monitor_enabled=monitor_enabled,
             start_sec=start_sec,
+            loop=loop,
             on_done=on_done,
         )
 
@@ -334,6 +336,7 @@ class MicInjector:
         send_to_mic: bool = False,
         monitor_enabled: bool = True,
         start_sec: float = 0.0,
+        loop: bool = False,
         on_done: Optional[Callable[[], None]] = None,
     ) -> bool:
         call_done_immediately = False
@@ -398,7 +401,7 @@ class MicInjector:
                                     mono_48k[:fn] *= np.linspace(0.0, 1.0, fn, dtype=np.float32)
                                 apo_gain = float(np.clip(volume if mic_volume is None else mic_volume, 0.0, 2.0))
                                 self._start_apo_stream(
-                                    mono_48k, gain=apo_gain, gen=gen, stop_evt=stop_evt, on_done=mark_done
+                                    mono_48k, gain=apo_gain, loop=loop, gen=gen, stop_evt=stop_evt, on_done=mark_done
                                 )
 
                             if play_speaker:
@@ -407,6 +410,7 @@ class MicInjector:
                                     sr,
                                     volume=float(np.clip(volume, 0.0, 2.0)),
                                     fade_in=fade_in,
+                                    loop=loop,
                                     gen=gen,
                                     stop_evt=stop_evt,
                                     on_done=mark_done,
@@ -421,6 +425,7 @@ class MicInjector:
         mono_48k: np.ndarray,
         *,
         gain: float,
+        loop: bool = False,
         gen: int,
         stop_evt: threading.Event,
         on_done: Callable[[], None],
@@ -436,23 +441,44 @@ class MicInjector:
                 t0 = time.perf_counter()
                 written = 0
 
-                first = min(total, lead_frames)
-                if first > 0 and not stop_evt.is_set():
-                    self._ring.write_samples(mono_48k[:first], enabled=1, gain=gain)
-                    pos = first
-                    written = first
+                def next_slice(count: int) -> np.ndarray:
+                    nonlocal pos
+                    if not loop:
+                        end = min(total, pos + count)
+                        out = mono_48k[pos:end]
+                        pos = end
+                        return out
+                    if pos + count <= total:
+                        out = mono_48k[pos:pos + count]
+                        pos = (pos + count) % total
+                        return out
+                    parts = []
+                    rem = count
+                    while rem > 0:
+                        take = min(rem, total - pos)
+                        parts.append(mono_48k[pos:pos + take])
+                        pos = (pos + take) % total
+                        rem -= take
+                    return np.concatenate(parts)
 
-                while pos < total and not stop_evt.is_set():
+                first = (lead_frames if loop else min(total, lead_frames)) if total > 0 else 0
+                if first > 0 and not stop_evt.is_set():
+                    blk = next_slice(first)
+                    self._ring.write_samples(blk, enabled=1, gain=gain)
+                    written = int(blk.size)
+
+                while total > 0 and (loop or pos < total) and not stop_evt.is_set():
                     target_t = t0 + max(0.0, (written - lead_frames) / float(RING_RATE))
                     wait = target_t - time.perf_counter()
                     if wait > 0.001:
                         stop_evt.wait(min(wait, 0.015))
                         if stop_evt.is_set():
                             break
-                    end = min(total, pos + chunk)
-                    self._ring.write_samples(mono_48k[pos:end], enabled=1, gain=gain)
-                    written += end - pos
-                    pos = end
+                    blk = next_slice(chunk)
+                    if blk.size == 0:
+                        break
+                    self._ring.write_samples(blk, enabled=1, gain=gain)
+                    written += int(blk.size)
 
                 if not stop_evt.is_set():
                     # Flush 30 ms tail silence so APO plays the end cleanly & fades out
@@ -483,6 +509,7 @@ class MicInjector:
         *,
         volume: float,
         fade_in: bool = False,
+        loop: bool = False,
         gen: int,
         stop_evt: threading.Event,
         on_done: Callable[[], None],
@@ -512,6 +539,19 @@ class MicInjector:
             if stop_evt.is_set():
                 outdata.fill(0)
                 raise sd.CallbackStop()
+            if loop:
+                if total <= 0:
+                    outdata.fill(0)
+                    raise sd.CallbackStop()
+                written = 0
+                pos = state["pos"]
+                while written < frames:
+                    take = min(frames - written, total - pos)
+                    outdata[written:written + take] = arr[pos:pos + take]
+                    written += take
+                    pos = (pos + take) % total
+                state["pos"] = pos
+                return
             pos = state["pos"]
             rem = total - pos
             if rem <= 0:

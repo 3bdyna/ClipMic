@@ -2897,7 +2897,7 @@ class MainWindow(QMainWindow):
         self._clip_play_seq: int = 0
         self._playing_clip_id: Optional[str] = None
         self._playing_clip_mode: Optional[str] = None  # "mic" or "preview"
-        self._clip_row_buttons: dict[str, tuple[QPushButton, QPushButton]] = {}
+        self._clip_row_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton]] = {}
         self._status_override_until: float = 0.0
         self._status_restore_timer = QTimer(self)
         self._status_restore_timer.setSingleShot(True)
@@ -3634,10 +3634,11 @@ class MainWindow(QMainWindow):
         """Reflect the currently active saved-clip playback state on row buttons and top Stop button."""
         active_id = self._playing_clip_id
         active_mode = self._playing_clip_mode
-        for cid, (prev_btn, mic_btn) in list(self._clip_row_buttons.items()):
+        for cid, (prev_btn, mic_btn, loop_btn) in list(self._clip_row_buttons.items()):
             try:
                 is_prev = cid == active_id and active_mode == "preview"
                 is_mic = cid == active_id and active_mode == "mic"
+                is_loop = cid == active_id and active_mode == "loop"
                 prev_btn.setText(t("common.stop") if is_prev else t("main.clip_preview_btn"))
                 prev_btn.setObjectName("Danger" if is_prev else "")
                 self._repolish_widget(prev_btn)
@@ -3645,6 +3646,10 @@ class MainWindow(QMainWindow):
                 mic_btn.setText(t("common.stop") if is_mic else t("main.clip_play_btn"))
                 mic_btn.setObjectName("Danger" if is_mic else "Accent")
                 self._repolish_widget(mic_btn)
+
+                loop_btn.setText(t("common.stop") if is_loop else t("main.clip_loop_btn"))
+                loop_btn.setObjectName("Danger" if is_loop else "")
+                self._repolish_widget(loop_btn)
             except RuntimeError:
                 self._clip_row_buttons.pop(cid, None)
 
@@ -4322,7 +4327,8 @@ class MainWindow(QMainWindow):
             self._set_status_message(t("main.clip_err_missing_wav", name=entry.name), hold_ms=4500, is_error=True)
             return
 
-        send_to_mic = mode == "mic"
+        is_loop = mode == "loop"
+        send_to_mic = mode in ("mic", "loop")
         if send_to_mic:
             self._injector.refresh_apo_status()
             if not self._injector.apo_installed:
@@ -4337,8 +4343,17 @@ class MainWindow(QMainWindow):
         self._playing_clip_id = clip_id
         self._playing_clip_mode = mode
         self._sync_clip_playback_buttons()
-        status_key = "main.status_playing_mic" if send_to_mic else "main.status_previewing_clip"
-        self._set_status_message(t(status_key, name=entry.name), hold_ms=60000, is_error=False)
+        if is_loop:
+            stop_hk = str(self._config.get("stop_hotkey", "") or "").strip()
+            msg = (
+                t("main.status_looping_mic", name=entry.name, hk=ltr(stop_hk))
+                if stop_hk
+                else t("main.status_looping_mic_no_hk", name=entry.name)
+            )
+            self._set_status_message(msg, hold_ms=86400000, is_error=False)
+        else:
+            status_key = "main.status_playing_mic" if send_to_mic else "main.status_previewing_clip"
+            self._set_status_message(t(status_key, name=entry.name), hold_ms=60000, is_error=False)
 
         try:
             started = self._injector.play_wav(
@@ -4347,6 +4362,7 @@ class MainWindow(QMainWindow):
                 mic_volume=mic_vol,
                 send_to_mic=send_to_mic,
                 monitor_enabled=mon if send_to_mic else True,
+                loop=is_loop,
                 on_done=lambda s=seq: self.clip_playback_done.emit(s),
             )
         except Exception as exc:
@@ -4364,6 +4380,9 @@ class MainWindow(QMainWindow):
 
     def play_clip_by_id(self, clip_id: str) -> None:
         self._start_saved_clip(clip_id, mode="mic")
+
+    def loop_clip_by_id(self, clip_id: str) -> None:
+        self._start_saved_clip(clip_id, mode="loop")
 
     def preview_clip_by_id(self, clip_id: str) -> None:
         self._start_saved_clip(clip_id, mode="preview")
@@ -4456,6 +4475,10 @@ class MainWindow(QMainWindow):
             play_btn.setToolTip(t("main.clip_play_tooltip"))
             play_btn.clicked.connect(lambda _=False, cid=clip.id: self.play_clip_by_id(cid))
 
+            loop_btn = QPushButton(t("main.clip_loop_btn"))
+            loop_btn.setToolTip(t("main.clip_loop_tooltip"))
+            loop_btn.clicked.connect(lambda _=False, cid=clip.id: self.loop_clip_by_id(cid))
+
             edit_btn = QPushButton(t("main.clip_edit_btn"))
             edit_btn.setToolTip(t("main.clip_edit_tooltip"))
             edit_btn.clicked.connect(lambda _=False, c=clip: self._edit_clip(c))
@@ -4471,12 +4494,13 @@ class MainWindow(QMainWindow):
             row.addSpacing(6)
             row.addWidget(preview_btn)
             row.addWidget(play_btn)
+            row.addWidget(loop_btn)
             row.addWidget(edit_btn)
             row.addWidget(del_btn)
 
             outer_row.addWidget(export_btn)
             outer_row.addWidget(card, 1)
-            self._clip_row_buttons[clip.id] = (preview_btn, play_btn)
+            self._clip_row_buttons[clip.id] = (preview_btn, play_btn, loop_btn)
             self._list_layout.insertWidget(idx, row_container)
 
         self._sync_clip_playback_buttons()

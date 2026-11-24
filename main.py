@@ -177,12 +177,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     injector = MicInjector()
     hotkeys = HotkeyManager()
 
-    ring.set_include_discord(bool(config.get("include_discord", True)))
+    ring.set_include_discord(True)
     try:
         ring.start(
             config.get("loopback_device"),
             mic_device=config.get("mic_device"),
-            capture_mic=bool(config.get("capture_mic_buffer", True)),
+            capture_mic=True,
             auto_reconnect=True,
         )
     except Exception as exc:

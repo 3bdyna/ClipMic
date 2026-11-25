@@ -22,3 +22,6 @@ clips.json
 config.json
 *.log
 *.tmp
+
+# Local agent instructions
+GEMINI.md

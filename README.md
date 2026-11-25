@@ -7,7 +7,6 @@
 **ClipMic is a free, open-source Windows 10/11 soundboard, instant-replay audio clipper, and direct microphone audio injector — a lightweight, zero-telemetry alternative to Soundpad and Voicemod.**
 
 [![Download Latest Windows Installer (.exe)](https://img.shields.io/badge/Download_Latest_Windows_Installer_(.exe)-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/3bdyna/clipmic/releases/latest)
-&nbsp; **[Direct link: Download Latest Windows Installer (.exe)](https://github.com/3bdyna/clipmic/releases/latest)**
 
 > **100% local & offline** · No account · No ads · Zero telemetry · SHA-256 verified auto-updates
 

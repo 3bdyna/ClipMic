@@ -48,12 +48,10 @@ Flat root architecture (keep source files minimal and avoid over-abstraction):
 11. **2-Word Publish Workflow (`publish update`):** When the user says `"publish update"`, check if tag `v<APP_VERSION>` already exists on GitHub; if so, auto-bump the patch version in `paths.py`, run tests, commit & push to `origin/main`, and run `.\scripts\build_release.ps1 -Publish`.
 
 ## Workspace & Coding Rules
-- Follow `GEMINI.md` strictly:
-  - Concise responses only: short bullets, zero filler, no recaps.
-  - Only read files explicitly needed for the current task. Never scan directories outside the project root unless given an exact file path.
-  - Make minimal, targeted edits; never rewrite whole files when a small diff works.
-  - Keep architecture flat and simple. No over-abstraction, no unused plugins, no telemetry, and no online downloaders.
-  - Stop and ask before installing heavy dependencies or editing Windows system/registry settings (including APO/startup changes outside normal app flow).
-  - Do not write sprawling test suites or long markdown docs unless asked.
+- Only read files explicitly needed for the current task. Never scan directories outside the project root unless given an exact file path.
+- Make minimal, targeted edits; never rewrite whole files when a small diff works.
+- Keep architecture flat and simple. No over-abstraction, no unused plugins, no telemetry, and no online downloaders.
+- Stop and ask before installing heavy dependencies or editing Windows system/registry settings (including APO/startup changes outside normal app flow).
+- Do not write sprawling test suites or long markdown docs unless asked.
 - Always run `$env:PYTHONPATH=".;tests"; python -m unittest test_clipmic -v` after code changes.
 - After every code or project update, stage, commit, and push changes to `origin/main` on GitHub.

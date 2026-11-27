@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover
     winreg = None  # type: ignore[assignment]
 
 APP_NAME = "ClipMic"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPO = "3bdyna/clipmic"
 STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "ClipMic"

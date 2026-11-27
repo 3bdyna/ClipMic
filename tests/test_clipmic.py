@@ -208,6 +208,43 @@ class TestTrimDialogPreviewUI(unittest.TestCase):
                 dlg.close()
                 inj.close()
 
+    def test_capture_dialogs_not_pinned_stays_on_top(self) -> None:
+        from PySide6.QtCore import Qt
+        import audio_buffer
+        import ui
+
+        inj = mic_inject.MicInjector()
+        with tempfile.TemporaryDirectory() as td:
+            wav = Path(td) / "clip.wav"
+            effects.write_wav(wav, np.zeros((48000, 2), dtype=np.int16), 48000)
+
+            ch = audio_buffer.ChannelClip(
+                key="game:fortnite",
+                name="Fortnite",
+                kind="game",
+                audio=np.zeros((48000, 2), dtype=np.float32),
+                sample_rate=48000,
+                peak_db=-10.0,
+                rms_db=-20.0,
+                ms_since_signal=0,
+                mini_peaks=np.zeros(40, dtype=np.float32),
+            )
+            snap = audio_buffer.CaptureSnapshot(48000, [ch])
+            picker = ui.ChannelPickerDialog(snap, inj, lambda: (True, 0.0, 0.0))
+            dlg = ui.TrimDialog(wav, inj, lambda: (True, 0.0, 0.0))
+            try:
+                self.assertFalse(bool(picker.windowFlags() & Qt.WindowType.WindowStaysOnTopHint))
+                self.assertFalse(bool(dlg.windowFlags() & Qt.WindowType.WindowStaysOnTopHint))
+                ui.bring_window_to_front_once(picker)
+                ui.bring_window_to_front_once(dlg)
+                self.assertFalse(bool(picker.windowFlags() & Qt.WindowType.WindowStaysOnTopHint))
+                self.assertFalse(bool(dlg.windowFlags() & Qt.WindowType.WindowStaysOnTopHint))
+            finally:
+                picker.close()
+                dlg.close()
+                snap.release()
+                inj.close()
+
 
 class TestEffectsAndAudioCore(unittest.TestCase):
     def test_probe_wav_duration_reads_header_accurately(self) -> None:

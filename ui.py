@@ -713,6 +713,37 @@ def apply_dark_titlebar(widget: QWidget, bg_hex: str = "#1a1c1f") -> None:
         pass
 
 
+def bring_window_to_front_once(widget: QWidget) -> None:
+    """Pop a window above the active app (e.g. borderless game) without pinning it on top."""
+    widget.show()
+    widget.raise_()
+    widget.activateWindow()
+    if sys.platform != "win32":
+        return
+    try:
+        hwnd = wt.HWND(int(widget.winId()))
+        if not hwnd.value:
+            return
+        user32 = ctypes.windll.user32
+        user32.SetWindowPos.argtypes = [
+            wt.HWND,
+            wt.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        user32.SetWindowPos.restype = wt.BOOL
+        flags = 0x0001 | 0x0002 | 0x0040  # SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
+        # Bounce HWND_TOPMOST (-1) -> HWND_NOTOPMOST (-2) so the dialog pops over
+        # borderless-fullscreen games on open, yet yields cleanly when clicking back.
+        user32.SetWindowPos(hwnd, wt.HWND(-1), 0, 0, 0, 0, flags)
+        user32.SetWindowPos(hwnd, wt.HWND(-2), 0, 0, 0, 0, flags)
+    except Exception:
+        pass
+
+
 def _text_align() -> Qt.AlignmentFlag:
     """Force explicit absolute horizontal alignment so Latin text aligns flush-right in Arabic RTL."""
     if is_rtl():
@@ -2172,7 +2203,6 @@ class ChannelPickerDialog(QDialog):
 
         self.setWindowTitle(t("picker.window_title"))
         self.setWindowIcon(make_app_icon())
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.setStyleSheet(DARK_QSS)
 
         self._rows: dict[str, tuple[QCheckBox, MiniWaveformWidget, QPushButton, ChannelClip]] = {}
@@ -2474,7 +2504,6 @@ class TrimDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(t("trim.window_title"))
         self.setWindowIcon(make_app_icon())
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.resize(680, 440)
         self.setStyleSheet(DARK_QSS)
 
@@ -5514,9 +5543,7 @@ class MainWindow(QMainWindow):
         picker.finished.connect(self._on_picker_finished)
         self._active_picker = picker
         ensure_on_screen(picker)
-        picker.show()
-        picker.raise_()
-        picker.activateWindow()
+        bring_window_to_front_once(picker)
 
     def _on_picker_finished(self, _res: int = 0) -> None:
         self._active_picker = None
@@ -5665,9 +5692,7 @@ class MainWindow(QMainWindow):
         dlg.finished.connect(self._on_trim_finished)
         self._active_popup = dlg
         ensure_on_screen(dlg)
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        bring_window_to_front_once(dlg)
 
     def _register_clip(self, entry: ClipEntry) -> None:
         replaced = False

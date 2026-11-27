@@ -31,27 +31,11 @@ Flat root architecture (keep source files minimal and avoid over-abstraction):
 ## Commands
 - **Run app:** `python main.py`
 - **Run tests:** `$env:PYTHONPATH=".;tests"; python -m unittest test_clipmic -v`
-- **Build local release installer (no publish):** `.\scripts\build_release.ps1`
-- **Publish release to GitHub:** `.\scripts\build_release.ps1 -Publish` (or `-SkipBuild -SkipTests -Publish` after verifying a clean local build)
+- **Releases, local install (`-InstallLocal`), installer/updater edits, or `"publish update"`:** Load the on-demand `publish-release` skill (`.agents/skills/publish-release/SKILL.md`).
 
-## Release, Installer & Updater Guardrails (DO NOT BREAK)
-1. **Single Version Source:** `paths.APP_VERSION` (`MAJOR.MINOR.PATCH`) is the ONLY hardcoded version string. Never hardcode versions in `ui.py`, `updater.py`, `installer/ClipMic.iss`, or `scripts/build_release.ps1`.
-2. **Never Change Inno Setup `AppId`:** The fixed GUID `{{8D4F6C2B-9A3E-4E71-B5C8-3F1D2E6A940B}` in `installer/ClipMic.iss` must NEVER change, or Windows will install duplicate copies instead of upgrading in-place.
-3. **Mutex Name Parity:** `main._MUTEX_NAME` (`Global\ClipMic_SingleInstance_Mutex`) MUST stay identical to `AppMutex` and `CheckForMutexes(...)` in `installer/ClipMic.iss` (enforced by automated tests). Always release the mutex in `main.py` before launching the silent installer.
-4. **User Data Preservation:** Never store user clips/configs inside the install directory, and NEVER delete `%LOCALAPPDATA%\ClipMic` during install, upgrade, or uninstall.
-5. **Updater Security Invariants:** Keep `updater.py` 100% Python stdlib (zero new pip packages). Never weaken `TRUSTED_DOWNLOAD_HOSTS`, never disable TLS verification or per-hop redirect validation, and never skip `SHA256SUMS.txt` verification before launching an installer.
-6. **Non-Intrusive Startup Checks:** Background startup update checks run ONLY in frozen builds (`paths.is_frozen()`), fail silently offline, and NEVER show modal dialogs on startup.
-7. **DirectMic APO DLL Upgrades:** `clipmic_apo.dll` is installed to `%ProgramData%\ClipMic\MicPlugin\` only via explicit elevated `apo_setup.py` flow when a user enables Direct Mic. Never silently modify Windows registry or `Audiosrv` from the per-user installer; if a future release updates `clipmic_apo.dll`, users refresh it via Disable Mic → Enable Mic.
-8. **Network Policy:** No telemetry and no third-party media/audio downloaders. The ONLY permitted outbound network traffic is `updater.py` querying and downloading hash-verified releases from `paths.GITHUB_REPO` on GitHub Releases.
-9. **Explicit Release Gate:** Never bump `paths.APP_VERSION`, create git tags, or run `-Publish` unless the user explicitly says `"publish update"` (or asks to release).
-10. **Smart Local App Updates:** Skip rebuilds for docs-only edits (`README.md`, `AGENTS.md`). While iterating on quick UI/small tweaks, you may batch local rebuilds unless the user asks to test the installed app now. When finishing a feature, changing critical logic, or ready to apply locally, run `.\scripts\build_release.ps1 -SkipTests -InstallLocal` (after tests pass and changes are committed/pushed) so the installed app updates in-place and relaunches automatically.
-11. **2-Word Publish Workflow (`publish update`):** When the user says `"publish update"`, check if tag `v<APP_VERSION>` already exists on GitHub; if so, auto-bump the patch version in `paths.py`, run full unit tests, commit & push to `origin/main`, and run `.\scripts\build_release.ps1 -Publish`.
-
-## Workspace & Coding Rules
-- Only read files explicitly needed for the current task. Never scan directories outside the project root unless given an exact file path.
-- Make minimal, targeted edits; never rewrite whole files when a small diff works.
-- Keep architecture flat and simple. No over-abstraction, no unused plugins, no telemetry, and no online downloaders.
-- Stop and ask before installing heavy dependencies or editing Windows system/registry settings (including APO/startup changes outside normal app flow).
-- Do not write sprawling test suites or long markdown docs unless asked.
-- **Smart Verification:** For small/iterative edits, run fast targeted verification (`python -m py_compile <touched.py>` or the relevant test class). Always run the full suite (`$env:PYTHONPATH=".;tests"; python -m unittest test_clipmic -v`) before finishing multi-file/critical changes (audio, updater, packaging, installer) or publishing a release.
-- After completing verified code or project updates, stage, commit, and push changes to `origin/main` on GitHub.
+## Always-On Guardrails & Coding Rules
+1. **Explicit Release Gate:** Never bump `paths.APP_VERSION`, create git tags, or run `-Publish` unless the user explicitly says `"publish update"` (or asks to release).
+2. **Core Safety Invariants:** `paths.APP_VERSION` is the single version source; keep `updater.py` 100% Python stdlib with HTTPS/TLS/SHA-256 checks; never store user data in the install dir or delete `%LOCALAPPDATA%\ClipMic`; no telemetry or third-party downloaders.
+3. **Flat & Minimal:** Only read files needed for the task; make targeted edits; keep architecture flat and simple. Stop and ask before installing heavy dependencies or editing Windows system/registry settings.
+4. **Smart Verification:** For small/iterative edits, run fast targeted verification (`python -m py_compile <touched.py>` or the relevant test class). Always run the full suite (`$env:PYTHONPATH=".;tests"; python -m unittest test_clipmic -v`) before finishing multi-file/critical changes (audio, updater, packaging, installer) or publishing a release.
+5. **Sync:** After completing verified updates, stage, commit, and push changes to `origin/main` on GitHub.

@@ -44,8 +44,8 @@ Flat root architecture (keep source files minimal and avoid over-abstraction):
 7. **DirectMic APO DLL Upgrades:** `clipmic_apo.dll` is installed to `%ProgramData%\ClipMic\MicPlugin\` only via explicit elevated `apo_setup.py` flow when a user enables Direct Mic. Never silently modify Windows registry or `Audiosrv` from the per-user installer; if a future release updates `clipmic_apo.dll`, users refresh it via Disable Mic → Enable Mic.
 8. **Network Policy:** No telemetry and no third-party media/audio downloaders. The ONLY permitted outbound network traffic is `updater.py` querying and downloading hash-verified releases from `paths.GITHUB_REPO` on GitHub Releases.
 9. **Explicit Release Gate:** Never bump `paths.APP_VERSION`, create git tags, or run `-Publish` unless the user explicitly says `"publish update"` (or asks to release).
-10. **Auto-Apply Local App Updates:** After any app code/UI edit (skip for docs-only edits like `README.md`/`AGENTS.md`), once unit tests pass and changes are committed/pushed, automatically run `.\scripts\build_release.ps1 -SkipTests -InstallLocal` so the user's installed app updates in-place and relaunches automatically.
-11. **2-Word Publish Workflow (`publish update`):** When the user says `"publish update"`, check if tag `v<APP_VERSION>` already exists on GitHub; if so, auto-bump the patch version in `paths.py`, run tests, commit & push to `origin/main`, and run `.\scripts\build_release.ps1 -Publish`.
+10. **Smart Local App Updates:** Skip rebuilds for docs-only edits (`README.md`, `AGENTS.md`). While iterating on quick UI/small tweaks, you may batch local rebuilds unless the user asks to test the installed app now. When finishing a feature, changing critical logic, or ready to apply locally, run `.\scripts\build_release.ps1 -SkipTests -InstallLocal` (after tests pass and changes are committed/pushed) so the installed app updates in-place and relaunches automatically.
+11. **2-Word Publish Workflow (`publish update`):** When the user says `"publish update"`, check if tag `v<APP_VERSION>` already exists on GitHub; if so, auto-bump the patch version in `paths.py`, run full unit tests, commit & push to `origin/main`, and run `.\scripts\build_release.ps1 -Publish`.
 
 ## Workspace & Coding Rules
 - Only read files explicitly needed for the current task. Never scan directories outside the project root unless given an exact file path.
@@ -53,5 +53,5 @@ Flat root architecture (keep source files minimal and avoid over-abstraction):
 - Keep architecture flat and simple. No over-abstraction, no unused plugins, no telemetry, and no online downloaders.
 - Stop and ask before installing heavy dependencies or editing Windows system/registry settings (including APO/startup changes outside normal app flow).
 - Do not write sprawling test suites or long markdown docs unless asked.
-- Always run `$env:PYTHONPATH=".;tests"; python -m unittest test_clipmic -v` after code changes.
-- After every code or project update, stage, commit, and push changes to `origin/main` on GitHub.
+- **Smart Verification:** For small/iterative edits, run fast targeted verification (`python -m py_compile <touched.py>` or the relevant test class). Always run the full suite (`$env:PYTHONPATH=".;tests"; python -m unittest test_clipmic -v`) before finishing multi-file/critical changes (audio, updater, packaging, installer) or publishing a release.
+- After completing verified code or project updates, stage, commit, and push changes to `origin/main` on GitHub.

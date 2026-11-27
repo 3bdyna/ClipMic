@@ -25,3 +25,6 @@ config.json
 
 # Local agent instructions
 GEMINI.md
+
+# Local promo video workspace (HyperFrames)
+promo-video/

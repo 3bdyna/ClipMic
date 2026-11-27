@@ -12,6 +12,8 @@
 
 ![ClipMic main soundboard window](docs/screenshots/main-soundboard.png)
 
+> **▶ [Watch the 20-second ClipMic Demo Video (1080p 60fps)](docs/media/clipmic-promo.mp4)**
+
 ---
 
 ## Features

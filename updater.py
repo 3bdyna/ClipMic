@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import hmac
 import http.client
@@ -9,6 +10,7 @@ import os
 import re
 import ssl
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.parse
@@ -251,6 +253,10 @@ class _SafeGitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     max_redirections = 5
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_url: Optional[str] = None
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         resolved = urllib.parse.urljoin(req.full_url, newurl)
         if not is_trusted_download_url(resolved):
@@ -260,19 +266,102 @@ class _SafeGitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
                 except Exception:
                     pass
             raise UntrustedUrlError(f"Blocked redirect to untrusted URL: {resolved}")
+        self.last_url = resolved
         return super().redirect_request(req, fp, code, msg, headers, resolved)
 
 
-def _build_safe_opener() -> urllib.request.OpenerDirector:
+def _is_missing_issuer_ssl_error(exc: BaseException) -> bool:
+    """Return True iff exc is an SSL verification error caused by an uncached Windows root CA."""
+    err: Optional[BaseException] = exc
+    if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, BaseException):
+        err = exc.reason
+    if not isinstance(err, ssl.SSLError):
+        return False
+    msg = str(err).lower()
+    return "unable to get issuer certificate" in msg or "unable to get local issuer certificate" in msg
+
+
+def _refresh_windows_root_store(urls: list[str], timeout: float = 5.0) -> bool:
+    """Trigger Windows Automatic Root Certificate Update via strict WinHTTP TLS for trusted hosts."""
+    if sys.platform != "win32":
+        return False
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for u in urls:
+        if not u or not is_trusted_download_url(u):
+            continue
+        host = (urllib.parse.urlsplit(u).hostname or "").lower()
+        if host and host not in seen:
+            seen.add(host)
+            hosts.append(host)
+    if not hosts:
+        return False
+
+    try:
+        import ctypes.wintypes as wt
+
+        wh = ctypes.windll.winhttp
+        wh.WinHttpOpen.argtypes = [wt.LPCWSTR, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
+        wh.WinHttpOpen.restype = wt.LPVOID
+        wh.WinHttpSetTimeouts.argtypes = [wt.LPVOID, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        wh.WinHttpSetTimeouts.restype = wt.BOOL
+        wh.WinHttpConnect.argtypes = [wt.LPVOID, wt.LPCWSTR, wt.WORD, wt.DWORD]
+        wh.WinHttpConnect.restype = wt.LPVOID
+        wh.WinHttpOpenRequest.argtypes = [
+            wt.LPVOID, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.LPVOID, wt.DWORD,
+        ]
+        wh.WinHttpOpenRequest.restype = wt.LPVOID
+        wh.WinHttpSendRequest.argtypes = [
+            wt.LPVOID, wt.LPCWSTR, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, ctypes.c_size_t,
+        ]
+        wh.WinHttpSendRequest.restype = wt.BOOL
+        wh.WinHttpCloseHandle.argtypes = [wt.LPVOID]
+        wh.WinHttpCloseHandle.restype = wt.BOOL
+
+        ms = max(1000, min(5000, int(timeout * 1000)))
+        session = wh.WinHttpOpen("ClipMic-TLS-Sync/1.0", 4, None, None, 0)  # WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+        if not session:
+            session = wh.WinHttpOpen("ClipMic-TLS-Sync/1.0", 0, None, None, 0)  # WINHTTP_ACCESS_TYPE_DEFAULT_PROXY
+        if not session:
+            return False
+
+        refreshed = False
+        try:
+            wh.WinHttpSetTimeouts(session, ms, ms, ms, ms)
+            for host in hosts:
+                conn = wh.WinHttpConnect(session, host, 443, 0)
+                if not conn:
+                    continue
+                try:
+                    # WINHTTP_FLAG_SECURE (0x00800000): strict Schannel TLS + triggers Windows AutoRootUpdate
+                    req = wh.WinHttpOpenRequest(conn, "HEAD", "/", None, None, None, 0x00800000)
+                    if not req:
+                        continue
+                    try:
+                        if wh.WinHttpSendRequest(req, None, 0, None, 0, 0, 0):
+                            refreshed = True
+                    finally:
+                        wh.WinHttpCloseHandle(req)
+                finally:
+                    wh.WinHttpCloseHandle(conn)
+        finally:
+            wh.WinHttpCloseHandle(session)
+        return refreshed
+    except Exception:
+        return False
+
+
+def _build_safe_opener() -> tuple[urllib.request.OpenerDirector, _SafeGitHubRedirectHandler]:
     """Build an HTTPS-only urllib opener (no HTTP, file://, or FTP handlers)."""
     opener = urllib.request.OpenerDirector()
+    redirect_handler = _SafeGitHubRedirectHandler()
     opener.add_handler(urllib.request.ProxyHandler())
     opener.add_handler(urllib.request.UnknownHandler())
     opener.add_handler(urllib.request.HTTPSHandler(context=_build_ssl_context()))
-    opener.add_handler(_SafeGitHubRedirectHandler())
+    opener.add_handler(redirect_handler)
     opener.add_handler(urllib.request.HTTPErrorProcessor())
     opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
-    return opener
+    return opener, redirect_handler
 
 
 def _open_trusted_url(
@@ -284,8 +373,21 @@ def _open_trusted_url(
     if not is_trusted_download_url(url):
         raise UntrustedUrlError(f"Refused untrusted update URL: {url}")
     req = urllib.request.Request(url, headers=headers, method="GET")
-    opener = _build_safe_opener()
-    resp = opener.open(req, timeout=timeout)
+    opener, redirect_handler = _build_safe_opener()
+    try:
+        resp = opener.open(req, timeout=timeout)
+    except (ssl.SSLError, urllib.error.URLError) as exc:
+        if _is_missing_issuer_ssl_error(exc):
+            targets = [url]
+            if redirect_handler.last_url:
+                targets.append(redirect_handler.last_url)
+            if _refresh_windows_root_store(targets, timeout=min(timeout, 5.0)):
+                retry_opener, _ = _build_safe_opener()
+                resp = retry_opener.open(req, timeout=timeout)
+            else:
+                raise
+        else:
+            raise
     final_url = resp.geturl() if hasattr(resp, "geturl") else url
     if final_url and not is_trusted_download_url(final_url):
         resp.close()

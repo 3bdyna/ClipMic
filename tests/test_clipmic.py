@@ -770,6 +770,44 @@ class TestUpdaterAndReleaseGuardrails(unittest.TestCase):
             self.assertEqual(res.status, "error")
             self.assertEqual(res.error_code, "network")
 
+    def test_missing_issuer_ssl_triggers_root_refresh_and_retry(self) -> None:
+        import ssl
+        import urllib.error
+        from unittest import mock
+
+        url = "https://api.github.com/repos/3bdyna/clipmic/releases/latest"
+        missing_err = urllib.error.URLError(
+            ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] unable to get issuer certificate")
+        )
+        ok_resp = _FakeHTTPResponse(b'{"tag_name": "v1.0.1"}', url)
+
+        first_opener = mock.Mock()
+        first_opener.open.side_effect = missing_err
+        second_opener = mock.Mock()
+        second_opener.open.return_value = ok_resp
+        redirect_h = updater._SafeGitHubRedirectHandler()
+
+        with mock.patch.object(
+            updater,
+            "_build_safe_opener",
+            side_effect=[(first_opener, redirect_h), (second_opener, redirect_h)],
+        ), mock.patch.object(updater, "_refresh_windows_root_store", return_value=True) as mock_refresh:
+            resp = updater._open_trusted_url(url, headers={"User-Agent": "ClipMic/1.0.1"}, timeout=5.0)
+            self.assertIs(resp, ok_resp)
+            mock_refresh.assert_called_once()
+            self.assertEqual(mock_refresh.call_args[0][0], [url])
+
+        # Non-issuer SSL error (e.g. hostname mismatch / revoked cert) must NOT trigger refresh
+        other_err = urllib.error.URLError(ssl.SSLCertVerificationError(1, "hostname mismatch"))
+        bad_opener = mock.Mock()
+        bad_opener.open.side_effect = other_err
+        with mock.patch.object(
+            updater, "_build_safe_opener", return_value=(bad_opener, redirect_h)
+        ), mock.patch.object(updater, "_refresh_windows_root_store") as mock_refresh2:
+            with self.assertRaises(urllib.error.URLError):
+                updater._open_trusted_url(url, headers={"User-Agent": "ClipMic/1.0.1"}, timeout=5.0)
+            mock_refresh2.assert_not_called()
+
     def test_download_and_verify_update_success_tamper_and_cancel(self) -> None:
         import hashlib
         from unittest import mock
